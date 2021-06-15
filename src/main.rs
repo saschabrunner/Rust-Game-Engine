@@ -16,7 +16,7 @@ use gfx_hal::{
         InputAssemblerDesc, Primitive, PrimitiveAssemblerDesc, Rasterizer, Rect, Specialization,
         Viewport,
     },
-    queue::{Queue, QueueFamily},
+    queue::{Queue, QueueFamily, QueueGroup},
     window::{Extent2D, PresentationSurface, Surface, SwapchainConfig},
     Instance,
 };
@@ -24,64 +24,253 @@ use gfx_hal::{
 use shaderc::ShaderKind;
 
 use winit::{
-    dpi::{LogicalSize, PhysicalSize},
+    dpi::LogicalSize,
     event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
+    event_loop::ControlFlow,
 };
 
-struct Resources<B: gfx_hal::Backend> {
-    instance: B::Instance,
-    surface: B::Surface,
+struct Renderer<B: gfx_hal::Backend> {
+    surface: ManuallyDrop<B::Surface>,
+    surface_format: Format,
+    surface_extent: Extent2D,
+    viewport: Viewport,
+    render_pass: ManuallyDrop<B::RenderPass>,
+    framebuffer: ManuallyDrop<B::Framebuffer>,
+    pipeline: ManuallyDrop<B::GraphicsPipeline>,
+    pipeline_layout: ManuallyDrop<B::PipelineLayout>, // todo: is this needed here?
+    //pipeline_cache: ManuallyDrop<B::PipelineCache> // todo: should I add this?
+    submission_complete_semaphores: Vec<B::Semaphore>,
+    submission_complete_fences: Vec<B::Fence>,
+    command_pools: Vec<B::CommandPool>,
+    command_buffers: Vec<B::CommandBuffer>,
+    frames_in_flight: usize,
+    frame: u64,
+    // these are dropped in the order they are declared, very important!
     device: B::Device,
-    render_passes: Vec<B::RenderPass>,
-    pipeline_layouts: Vec<B::PipelineLayout>,
-    pipelines: Vec<B::GraphicsPipeline>,
-    framebuffers: Vec<B::Framebuffer>,
-    command_pool: B::CommandPool,
-    submission_complete_fence: B::Fence,
-    rendering_complete_semaphore: B::Semaphore,
+    adapter: Adapter<B>,
+    queue_group: QueueGroup<B>,
+    instance: B::Instance,
 }
 
-// we create a tuple struct that wraps Resources in a ManuallyDrop
-// so we can take ownership and destroy the resources using the
-// destroy_ functions, which require ownership instead of just
-// a borrow
-struct ResourceHolder<B: gfx_hal::Backend>(ManuallyDrop<Resources<B>>);
+impl<B: gfx_hal::Backend> Renderer<B> {
+    fn new(
+        instance: B::Instance,
+        mut surface: B::Surface,
+        //surface_extent: Extent2D, todo: might not need that due to use of capabilities
+        adapter: Adapter<B>,
+    ) -> Renderer<B> {
+        let queue_family = find_queue_family(&adapter, &surface);
+        let physical_device = &adapter.physical_device;
 
-impl<B: gfx_hal::Backend> Drop for ResourceHolder<B> {
-    fn drop(&mut self) {
-        // todo: this implementation is not complete and results in a crash
+        let mut gpu = unsafe {
+            physical_device
+                .open(&[(queue_family, &[1.0])], gfx_hal::Features::empty())
+                .expect("Failed to open device")
+        };
+
+        let device = gpu.device;
+        let queue_group = gpu.queue_groups.pop().unwrap();
+
+        // a command pool allocates command buffers and is supposed to be used from a single thread only
+        let mut command_pool = unsafe {
+            device.create_command_pool(queue_group.family, CommandPoolCreateFlags::empty())
+        }
+        .expect("Out of memory creating command pool");
+
+        // mutable access to command_pool required here
+        let command_buffer = unsafe { command_pool.allocate_one(Level::Primary) };
+
+        let surface_format = find_surface_format::<B>(physical_device, &surface);
+        let render_pass = create_render_pass::<B>(&device, surface_format);
+
+        // used for uniforms and push constants in the future
+        let pipeline_layout = ManuallyDrop::new(unsafe {
+            device
+                .create_pipeline_layout(iter::empty(), iter::empty())
+                .expect("Out of memory creating pipeline layout")
+        });
+        let vertex_shader = include_str!("../data/shaders/01_triangle.vert");
+        let fragment_shader = include_str!("../data/shaders/01_single_color.frag");
+        let pipeline = unsafe {
+            make_pipeline::<B>(
+                &device,
+                &render_pass,
+                &*pipeline_layout,
+                vertex_shader,
+                fragment_shader,
+            )
+        };
+
+        // framebuffer connects attachments to images
+        // attachments can be thought of as the slots
+        // and the images fill those slots
+        // todo: clean up the following code
+        // store and reuse the capabilities later and so on
+        let caps = surface.capabilities(&adapter.physical_device);
+        //let surface_extent = caps.current_extent.unwrap(); // todo: see if this works
+        let mut surface_extent = Extent2D {
+            width: DEFAULT_WINDOW_SIZE[0],
+            height: DEFAULT_WINDOW_SIZE[1],
+        };
+        println!("{:?}", surface_extent); // todo: remove
+        let swapchain_config = SwapchainConfig::from_caps(&caps, surface_format, surface_extent);
+        surface_extent = swapchain_config.extent; // todo: document
+        let framebuffer_attachment = swapchain_config.framebuffer_attachment();
+
         unsafe {
-            let Resources {
-                instance,
-                mut surface,
-                device,
-                command_pool,
-                render_passes,
-                pipeline_layouts,
-                pipelines,
-                framebuffers,
-                submission_complete_fence,
-                rendering_complete_semaphore,
-            } = ManuallyDrop::take(&mut self.0); // we "read" the value behind this ManuallyDrop
+            surface
+                .configure_swapchain(&device, swapchain_config)
+                .expect("Failed to configure swapchain");
+        }
 
-            device.destroy_command_pool(command_pool);
-            device.destroy_semaphore(rendering_complete_semaphore);
-            device.destroy_fence(submission_complete_fence);
-            for render_pass in render_passes {
-                device.destroy_render_pass(render_pass);
+        let framebuffer = ManuallyDrop::new(unsafe {
+            device
+                .create_framebuffer(
+                    &render_pass,
+                    iter::once(framebuffer_attachment),
+                    Extent {
+                        width: surface_extent.width,
+                        height: surface_extent.height,
+                        depth: 1,
+                    },
+                )
+                .unwrap()
+        });
+
+        let submission_complete_fence = device
+            .create_fence(true)
+            .expect("Out of memory creating fence");
+
+        let rendering_complete_semaphore = device
+            .create_semaphore()
+            .expect("Out of memory creating semaphore");
+
+        let viewport = Viewport {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: surface_extent.width as i16,
+                h: surface_extent.height as i16,
+            },
+            depth: 0.0..1.0,
+        };
+
+        Renderer {
+            surface: ManuallyDrop::new(surface),
+            surface_format,
+            surface_extent,
+            viewport,
+            render_pass,
+            framebuffer,
+            pipeline,
+            pipeline_layout,
+            submission_complete_semaphores: vec![rendering_complete_semaphore], //todo: rename
+            submission_complete_fences: vec![submission_complete_fence],
+            command_pools: vec![command_pool],
+            command_buffers: vec![command_buffer],
+            frames_in_flight: 1, //todo
+            frame: 0,
+            device,
+            adapter,
+            queue_group,
+            instance,
+        }
+    }
+
+    fn recreate_swapchain(&mut self) {
+        // todo: update according to example for better functionality and to avoid memory leaks
+        let caps = self.surface.capabilities(&self.adapter.physical_device);
+
+        let swapchain_config =
+            SwapchainConfig::from_caps(&caps, self.surface_format, self.surface_extent);
+
+        // update surface extent, since the swapchain might enforce different dimensions
+        self.surface_extent = swapchain_config.extent;
+
+        unsafe {
+            self.surface
+                .configure_swapchain(&self.device, swapchain_config)
+                .expect("Failed to configure swapchain");
+        }
+    }
+
+    fn render(&mut self) {
+        // todo: support multiple of these
+        let submission_complete_fence = &mut self.submission_complete_fences[0];
+        let submission_complete_semaphore = &mut self.submission_complete_semaphores[0];
+        let command_pool = &mut self.command_pools[0];
+        let command_buffer = &mut self.command_buffers[0];
+
+        unsafe {
+            // wait for the last submission to finish before resetting command pool and preparing new frame
+            let render_timeout_ns = 1_000_000_000;
+            self.device
+                .wait_for_fence(submission_complete_fence, render_timeout_ns)
+                .expect("Out of memory or device lost waiting for fence");
+            self.device
+                .reset_fence(submission_complete_fence)
+                .expect("Out of memory resetting fence");
+            command_pool.reset(false);
+        }
+
+        let surface_image = unsafe {
+            let acquire_timeout_ns = 1_000_000_000;
+
+            match self.surface.acquire_image(acquire_timeout_ns) {
+                Ok((image, _)) => image,
+                Err(_) => {
+                    self.recreate_swapchain();
+                    //should_configure_swapchain = true;
+                    return;
+                }
             }
-            for framebuffer in framebuffers {
-                device.destroy_framebuffer(framebuffer);
+        };
+
+        unsafe {
+            command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
+            // viewports and scissors are part of the command buffer, different to Vulkan
+            command_buffer.set_viewports(0, iter::once(self.viewport.clone()));
+            command_buffer.set_scissors(0, iter::once(self.viewport.rect));
+
+            command_buffer.begin_render_pass(
+                &self.render_pass,
+                &self.framebuffer,
+                self.viewport.rect,
+                // clear value is part of each render attachment info
+                iter::once(RenderAttachmentInfo {
+                    image_view: surface_image.borrow(), // borrow returns borrow of diff type
+                    clear_value: ClearValue {
+                        color: ClearColor {
+                            float32: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                }),
+                SubpassContents::Inline,
+            );
+
+            command_buffer.bind_graphics_pipeline(&self.pipeline);
+            command_buffer.draw(0..3, 0..1);
+            command_buffer.end_render_pass();
+            command_buffer.finish();
+        }
+
+        unsafe {
+            self.queue_group.queues[0].submit(
+                iter::once(&*command_buffer),
+                iter::empty(),
+                iter::once(&*submission_complete_semaphore),
+                Some(submission_complete_fence),
+            );
+
+            let result = self.queue_group.queues[0].present(
+                &mut self.surface,
+                surface_image,
+                Some(submission_complete_semaphore),
+            );
+
+            if result.is_err() {
+                self.recreate_swapchain();
             }
-            surface.unconfigure_swapchain(&device);
-            for pipeline in pipelines {
-                device.destroy_graphics_pipeline(pipeline);
-            }
-            for pipeline_layout in pipeline_layouts {
-                device.destroy_pipeline_layout(pipeline_layout);
-            }
-            instance.destroy_surface(surface);
         }
     }
 }
@@ -91,12 +280,7 @@ const DEFAULT_WINDOW_SIZE: [u32; 2] = [512, 512];
 
 fn main() {
     let event_loop = winit::event_loop::EventLoop::new();
-    let (logical_window_size, physical_window_size) = get_window_sizes(&event_loop);
-
-    let mut surface_extent = Extent2D {
-        width: physical_window_size.width,
-        height: physical_window_size.height,
-    };
+    let logical_window_size: LogicalSize<u32> = DEFAULT_WINDOW_SIZE.into();
 
     let window = winit::window::WindowBuilder::new()
         .with_title(APPLICATION_NAME)
@@ -114,256 +298,54 @@ fn main() {
     };
 
     let adapter: Adapter<backend::Backend> = find_adapter(&instance);
-    let (device, mut queue_group) = {
-        let queue_family = find_queue_family(&adapter, &surface);
 
-        let mut gpu = unsafe {
-            adapter
-                .physical_device
-                .open(&[(queue_family, &[1.0])], gfx_hal::Features::empty())
-                .expect("Failed to open device")
-        };
+    let mut renderer = Renderer::new(instance, surface, adapter);
 
-        (gpu.device, gpu.queue_groups.pop().unwrap())
-    };
-
-    let (command_pool, mut command_buffer) = unsafe {
-        // a command pool allocates command buffers and is supposed to be used from a single thread only
-        let mut command_pool = device
-            .create_command_pool(queue_group.family, CommandPoolCreateFlags::empty())
-            .expect("Out of memory creating command pool");
-
-        // mutable access to command_pool required here
-        let command_buffer = command_pool.allocate_one(Level::Primary);
-
-        // Even though command_buffer isn't declared mut,
-        // because we're handing over ownership, the new
-        // declaration may be mut!
-        // command_pool however is no longer needed mutable
-        // so we hand it over into a non mut variable.
-        (command_pool, command_buffer)
-    };
-
-    let surface_color_format = find_surface_color_format(&adapter, &surface);
-
-    let render_pass = create_render_pass::<backend::Backend>(&device, surface_color_format);
-
-    // used for uniforms and push constants in the future
-    let pipeline_layout = unsafe {
-        device
-            .create_pipeline_layout(iter::empty(), iter::empty())
-            .expect("Out of memory creating pipeline layout")
-    };
-
-    let vertex_shader = include_str!("../data/shaders/01_triangle.vert");
-    let fragment_shader = include_str!("../data/shaders/01_single_color.frag");
-
-    let pipeline = unsafe {
-        make_pipeline::<backend::Backend>(
-            &device,
-            &render_pass,
-            &pipeline_layout,
-            vertex_shader,
-            fragment_shader,
-        )
-    };
-
-    // framebuffer connects attachments to images
-    // attachments can be thought of as the slots
-    // and the images fill those slots
-    let framebuffer = unsafe {
-        // todo: clean up the following code
-        // store and reuse the capabilities later and so on
-        let caps = surface.capabilities(&adapter.physical_device);
-
-        let swapchain_config =
-            SwapchainConfig::from_caps(&caps, surface_color_format, surface_extent);
-
-        let framebuffer_attachment = swapchain_config.framebuffer_attachment();
-
-        device
-            .create_framebuffer(
-                &render_pass,
-                iter::once(framebuffer_attachment),
-                Extent {
-                    width: surface_extent.width,
-                    height: surface_extent.height,
-                    depth: 1,
-                },
-            )
-            .unwrap()
-    };
-
-    let submission_complete_fence = device
-        .create_fence(true)
-        .expect("Out of memory creating fence");
-    let rendering_complete_semaphore = device
-        .create_semaphore()
-        .expect("Out of memory creating semaphore");
-
-    let mut resource_holder: ResourceHolder<backend::Backend> =
-        ResourceHolder(ManuallyDrop::new(Resources {
-            instance,
-            surface,
-            device,
-            command_pool,
-            render_passes: vec![render_pass],
-            pipeline_layouts: vec![pipeline_layout],
-            pipelines: vec![pipeline],
-            framebuffers: vec![framebuffer],
-            submission_complete_fence,
-            rendering_complete_semaphore,
-        }));
-
-    // flag to keep check if swapchain needs to be reconfigured next refresh
-    let mut should_configure_swapchain = true;
-
-    event_loop.run(move |event, _, control_flow| {
-        match event {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                WindowEvent::Resized(dimensions) => {
-                    surface_extent = Extent2D {
-                        width: dimensions.width,
-                        height: dimensions.height,
-                    };
-                    should_configure_swapchain = true;
-                }
-                WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
-                    surface_extent = Extent2D {
-                        width: new_inner_size.width,
-                        height: new_inner_size.height,
-                    };
-                    should_configure_swapchain = true;
-                }
-                _ => (),
-            },
-            Event::MainEventsCleared => window.request_redraw(),
-            Event::RedrawRequested(_) => {
-                let res: &mut Resources<_> = &mut resource_holder.0; // alternative &mut Resources<backend::Backend>
-                let render_pass = &res.render_passes[0];
-                let pipeline = &res.pipelines[0];
-
-                unsafe {
-                    // wait for the last submission to finish before resetting command pool and preparing new frame
-                    let render_timeout_ns = 1_000_000_000;
-                    res.device
-                        .wait_for_fence(&res.submission_complete_fence, render_timeout_ns)
-                        .expect("Out of memory or device lost waiting for fence");
-                    res.device
-                        .reset_fence(&mut res.submission_complete_fence)
-                        .expect("Out of memory resetting fence");
-                    res.command_pool.reset(false);
-                }
-
-                if should_configure_swapchain {
-                    let caps = res.surface.capabilities(&adapter.physical_device);
-
-                    let swapchain_config =
-                        SwapchainConfig::from_caps(&caps, surface_color_format, surface_extent);
-
-                    // update surface extent, since the swapchain might enforce different dimensions
-                    surface_extent = swapchain_config.extent;
-
-                    unsafe {
-                        res.surface
-                            .configure_swapchain(&res.device, swapchain_config)
-                            .expect("Failed to configure swapchain");
-                    }
-
-                    should_configure_swapchain = false;
-                }
-
-                let surface_image = unsafe {
-                    let acquire_timeout_ns = 1_000_000_000;
-
-                    match res.surface.acquire_image(acquire_timeout_ns) {
-                        Ok((image, _)) => image,
-                        Err(_) => {
-                            should_configure_swapchain = true;
-                            return;
-                        }
-                    }
+    event_loop.run(move |event, _, control_flow| match event {
+        Event::WindowEvent { event, .. } => match event {
+            WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+            WindowEvent::Resized(dimensions) => {
+                renderer.surface_extent = Extent2D {
+                    width: dimensions.width,
+                    height: dimensions.height,
                 };
-
-                let viewport = Viewport {
-                    rect: Rect {
-                        x: 0,
-                        y: 0,
-                        w: surface_extent.width as i16,
-                        h: surface_extent.height as i16,
-                    },
-                    depth: 0.0..1.0,
+                renderer.recreate_swapchain();
+            }
+            WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                renderer.surface_extent = Extent2D {
+                    width: new_inner_size.width,
+                    height: new_inner_size.height,
                 };
-
-                unsafe {
-                    command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
-                    // viewports and scissors are part of the command buffer, different to Vulkan
-                    command_buffer.set_viewports(0, iter::once(viewport.clone()));
-                    command_buffer.set_scissors(0, iter::once(viewport.rect));
-
-                    command_buffer.begin_render_pass(
-                        render_pass,
-                        &res.framebuffers[0], // todo: switch to single framebuffer in gfx
-                        viewport.rect,
-                        // clear value is part of each render attachment info
-                        iter::once(RenderAttachmentInfo {
-                            image_view: surface_image.borrow(), // borrow returns borrow of diff type
-                            clear_value: ClearValue {
-                                color: ClearColor {
-                                    float32: [0.0, 0.0, 0.0, 1.0],
-                                },
-                            },
-                        }),
-                        SubpassContents::Inline,
-                    );
-
-                    command_buffer.bind_graphics_pipeline(pipeline);
-                    command_buffer.draw(0..3, 0..1);
-                    command_buffer.end_render_pass();
-                    command_buffer.finish();
-                }
-
-                unsafe {
-                    queue_group.queues[0].submit(
-                        iter::once(&command_buffer),
-                        iter::empty(),
-                        iter::once(&res.rendering_complete_semaphore),
-                        Some(&mut res.submission_complete_fence),
-                    );
-
-                    let result = queue_group.queues[0].present(
-                        &mut res.surface,
-                        surface_image,
-                        Some(&mut res.rendering_complete_semaphore),
-                    );
-
-                    should_configure_swapchain |= result.is_err();
-                }
+                renderer.recreate_swapchain();
             }
             _ => (),
+        },
+        Event::MainEventsCleared => window.request_redraw(),
+        Event::RedrawRequested(_) => {
+            renderer.render();
         }
+        _ => (),
     });
 }
 
-fn get_window_sizes<T>(event_loop: &EventLoop<T>) -> (LogicalSize<u32>, PhysicalSize<u32>) {
-    // get either the primary monitor's dpi or the
-    // monitor with the highest dpi (on Wayland for example)
-    let primary_monitor = event_loop.primary_monitor();
-    let dpi = match primary_monitor {
-        Some(primary_monitor) => primary_monitor.scale_factor(),
-        None => event_loop
-            .available_monitors()
-            .map(|monitor| monitor.scale_factor())
-            .max_by(|a, b| a.partial_cmp(b).unwrap())
-            .unwrap_or(0.0),
-    };
+// fn get_window_sizes<T>(event_loop: &EventLoop<T>) -> (LogicalSize<u32>, PhysicalSize<u32>) {
+//     // get either the primary monitor's dpi or the
+//     // monitor with the highest dpi (on Wayland for example)
+//     let primary_monitor = event_loop.primary_monitor();
+//     let dpi = match primary_monitor {
+//         Some(primary_monitor) => primary_monitor.scale_factor(),
+//         None => event_loop
+//             .available_monitors()
+//             .map(|monitor| monitor.scale_factor())
+//             .max_by(|a, b| a.partial_cmp(b).unwrap())
+//             .unwrap_or(0.0),
+//     };
 
-    let logical: LogicalSize<u32> = DEFAULT_WINDOW_SIZE.into();
-    let physical: PhysicalSize<u32> = logical.to_physical(dpi);
+//     let logical: LogicalSize<u32> = DEFAULT_WINDOW_SIZE.into();
+//     let physical: PhysicalSize<u32> = logical.to_physical(dpi);
 
-    (logical, physical)
-}
+//     (logical, physical)
+// }
 
 fn find_adapter<B: gfx_hal::Backend>(instance: &B::Instance) -> Adapter<B> {
     // multiple adapters might exist, like an internal and a dedicated GPU
@@ -384,14 +366,12 @@ fn find_queue_family<'a, B: gfx_hal::Backend>(
         .expect("No compatible queue family found")
 }
 
-fn find_surface_color_format<B: gfx_hal::Backend>(
-    adapter: &Adapter<B>,
+fn find_surface_format<B: gfx_hal::Backend>(
+    physical_device: &B::PhysicalDevice,
     surface: &B::Surface,
 ) -> Format {
     // get the formats that the surface and the adapter support together
-    let supported_formats = surface
-        .supported_formats(&adapter.physical_device)
-        .unwrap_or(vec![]);
+    let supported_formats = surface.supported_formats(physical_device).unwrap_or(vec![]);
 
     // if supported_formats is empty, it means we can choose freely
     let default_format = *supported_formats.get(0).unwrap_or(&Format::Rgba8Srgb);
@@ -406,7 +386,7 @@ fn find_surface_color_format<B: gfx_hal::Backend>(
 fn create_render_pass<B: gfx_hal::Backend>(
     device: &B::Device,
     surface_color_format: Format,
-) -> B::RenderPass {
+) -> ManuallyDrop<B::RenderPass> {
     // https://vulkan-tutorial.com/en/Drawing_a_triangle/Graphics_pipeline_basics/Render_passes
     let color_attachment = Attachment {
         format: Some(surface_color_format),
@@ -423,7 +403,8 @@ fn create_render_pass<B: gfx_hal::Backend>(
         resolves: &[],
         preserves: &[],
     };
-    unsafe {
+
+    ManuallyDrop::new(unsafe {
         device
             .create_render_pass(
                 iter::once(color_attachment),
@@ -431,7 +412,7 @@ fn create_render_pass<B: gfx_hal::Backend>(
                 iter::empty(),
             )
             .expect("Out of memory creating render pass")
-    }
+    })
 }
 
 fn compile_shader(glsl: &str, shader_kind: ShaderKind) -> Vec<u32> {
@@ -450,7 +431,7 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
     pipeline_layout: &B::PipelineLayout,
     vertex_shader: &str,
     fragment_shader: &str,
-) -> B::GraphicsPipeline {
+) -> ManuallyDrop<B::GraphicsPipeline> {
     let vertex_shader_module = device
         .create_shader_module(&compile_shader(vertex_shader, ShaderKind::Vertex))
         .expect("Failed to create vertex shader module");
@@ -509,5 +490,5 @@ unsafe fn make_pipeline<B: gfx_hal::Backend>(
     // them to machine code and we don't need the spir-v intermediate anymore
     device.destroy_shader_module(vertex_shader_module);
     device.destroy_shader_module(fragment_shader_module);
-    pipeline
+    ManuallyDrop::new(pipeline)
 }
