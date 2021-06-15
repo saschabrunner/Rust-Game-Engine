@@ -53,13 +53,13 @@ struct Renderer<B: gfx_hal::Backend> {
 }
 
 impl<B: gfx_hal::Backend> Renderer<B> {
-    fn new(
+    pub fn new(
         instance: B::Instance,
         mut surface: B::Surface,
         //surface_extent: Extent2D, todo: might not need that due to use of capabilities
         adapter: Adapter<B>,
     ) -> Renderer<B> {
-        let queue_family = find_queue_family(&adapter, &surface);
+        let queue_family = Self::find_queue_family(&adapter, &surface);
         let physical_device = &adapter.physical_device;
 
         let mut gpu = unsafe {
@@ -80,8 +80,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         // mutable access to command_pool required here
         let command_buffer = unsafe { command_pool.allocate_one(Level::Primary) };
 
-        let surface_format = find_surface_format::<B>(physical_device, &surface);
-        let render_pass = create_render_pass::<B>(&device, surface_format);
+        let surface_format = Self::find_surface_format(physical_device, &surface);
+        let render_pass = Self::create_render_pass(&device, surface_format);
 
         // used for uniforms and push constants in the future
         let pipeline_layout = ManuallyDrop::new(unsafe {
@@ -92,7 +92,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         let vertex_shader = include_str!("../data/shaders/01_triangle.vert");
         let fragment_shader = include_str!("../data/shaders/01_single_color.frag");
         let pipeline = unsafe {
-            make_pipeline::<B>(
+            Self::make_pipeline(
                 &device,
                 &render_pass,
                 &*pipeline_layout,
@@ -177,7 +177,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         }
     }
 
-    fn recreate_swapchain(&mut self) {
+    pub fn recreate_swapchain(&mut self) {
         let capabilities = self.surface.capabilities(&self.adapter.physical_device);
         let swapchain_config =
             SwapchainConfig::from_caps(&capabilities, self.surface_format, self.surface_extent);
@@ -211,7 +211,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         }
     }
 
-    fn render(&mut self) {
+    pub fn render(&mut self) {
         // todo: support multiple of these
         let submission_complete_fence = &mut self.submission_complete_fences[0];
         let submission_complete_semaphore = &mut self.submission_complete_semaphores[0];
@@ -289,6 +289,134 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 self.recreate_swapchain();
             }
         }
+    }
+
+    fn find_queue_family<'a>(adapter: &'a Adapter<B>, surface: &B::Surface) -> &'a B::QueueFamily {
+        adapter
+            .queue_families
+            .iter()
+            .find(|family| {
+                surface.supports_queue_family(family) && family.queue_type().supports_graphics()
+            })
+            .expect("No compatible queue family found")
+    }
+
+    fn find_surface_format(physical_device: &B::PhysicalDevice, surface: &B::Surface) -> Format {
+        // get the formats that the surface and the adapter support together
+        let supported_formats = surface.supported_formats(physical_device).unwrap_or(vec![]);
+        // if supported_formats is empty, it means we can choose freely
+        let default_format = *supported_formats.get(0).unwrap_or(&Format::Rgba8Srgb);
+        // try to find an srgb format, otherwise fallback to the first format we found above
+        supported_formats
+            .into_iter()
+            .find(|format| format.base_format().1 == ChannelType::Srgb)
+            .unwrap_or(default_format)
+    }
+    fn create_render_pass(
+        device: &B::Device,
+        surface_color_format: Format,
+    ) -> ManuallyDrop<B::RenderPass> {
+        // https://vulkan-tutorial.com/en/Drawing_a_triangle/Graphics_pipeline_basics/Render_passes
+        let color_attachment = Attachment {
+            format: Some(surface_color_format),
+            samples: 1, // no multi-sampling (yet)
+            ops: AttachmentOps::new(AttachmentLoadOp::Clear, AttachmentStoreOp::Store), // clear at start, store at end
+            stencil_ops: AttachmentOps::DONT_CARE, // no stencil usage yet
+            layouts: Layout::Undefined..Layout::Present, // don't mind layout at the start, but want to present at end
+        };
+
+        let subpass = SubpassDesc {
+            colors: &[(0, Layout::ColorAttachmentOptimal)],
+            depth_stencil: None,
+            inputs: &[],
+            resolves: &[],
+            preserves: &[],
+        };
+
+        ManuallyDrop::new(unsafe {
+            device
+                .create_render_pass(
+                    iter::once(color_attachment),
+                    iter::once(subpass),
+                    iter::empty(),
+                )
+                .expect("Out of memory creating render pass")
+        })
+    }
+    fn compile_shader(glsl: &str, shader_kind: ShaderKind) -> Vec<u32> {
+        let mut compiler = shaderc::Compiler::new().unwrap();
+        let compiled_shader = compiler
+            .compile_into_spirv(glsl, shader_kind, "unnamed", "main", None)
+            .expect("Failed to compile shader");
+        compiled_shader.as_binary().to_vec()
+    }
+    unsafe fn make_pipeline(
+        device: &B::Device,
+        render_pass: &B::RenderPass,
+        pipeline_layout: &B::PipelineLayout,
+        vertex_shader: &str,
+        fragment_shader: &str,
+    ) -> ManuallyDrop<B::GraphicsPipeline> {
+        let vertex_shader_module = device
+            .create_shader_module(&Self::compile_shader(vertex_shader, ShaderKind::Vertex))
+            .expect("Failed to create vertex shader module");
+
+        let fragment_shader_module = device
+            .create_shader_module(&Self::compile_shader(fragment_shader, ShaderKind::Fragment))
+            .expect("Failed to create fragment shader module");
+
+        let (vs_entry, fs_entry) = (
+            EntryPoint {
+                entry: "main",
+                module: &vertex_shader_module,
+                specialization: Specialization::default(), // specializations can be used for constants later
+            },
+            EntryPoint {
+                entry: "main",
+                module: &fragment_shader_module,
+                specialization: Specialization::default(),
+            },
+        );
+
+        // https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Fixed_functions
+        let primitive_assembler = PrimitiveAssemblerDesc::Vertex {
+            buffers: &[],
+            attributes: &[],
+            input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
+            vertex: vs_entry,
+            tessellation: None,
+            geometry: None,
+        };
+
+        let mut pipeline_desc = GraphicsPipelineDesc::new(
+            primitive_assembler,
+            Rasterizer {
+                cull_face: Face::BACK,
+                ..Rasterizer::FILL // this is the struct update syntax
+            },
+            Some(fs_entry),
+            pipeline_layout,
+            Subpass {
+                index: 0,
+                main_pass: render_pass,
+            },
+        );
+
+        pipeline_desc.blender.targets.push(ColorBlendDesc {
+            mask: ColorMask::ALL,
+            blend: Some(BlendState::ALPHA),
+        });
+
+        let pipeline = device
+            .create_graphics_pipeline(&pipeline_desc, None)
+            .expect("Failed to create graphics pipeline");
+
+        // shader modules can be destroyed now, since the pipeline compiled
+        // them to machine code and we don't need the spir-v intermediate anymore
+        device.destroy_shader_module(vertex_shader_module);
+        device.destroy_shader_module(fragment_shader_module);
+
+        ManuallyDrop::new(pipeline)
     }
 }
 
@@ -409,144 +537,4 @@ fn find_adapter<B: gfx_hal::Backend>(instance: &B::Instance) -> Adapter<B> {
     // multiple adapters might exist, like an internal and a dedicated GPU
     // an algorithm could be implemented here to select a different GPU
     instance.enumerate_adapters().remove(0)
-}
-
-fn find_queue_family<'a, B: gfx_hal::Backend>(
-    adapter: &'a Adapter<B>,
-    surface: &B::Surface,
-) -> &'a B::QueueFamily {
-    adapter
-        .queue_families
-        .iter()
-        .find(|family| {
-            surface.supports_queue_family(family) && family.queue_type().supports_graphics()
-        })
-        .expect("No compatible queue family found")
-}
-
-fn find_surface_format<B: gfx_hal::Backend>(
-    physical_device: &B::PhysicalDevice,
-    surface: &B::Surface,
-) -> Format {
-    // get the formats that the surface and the adapter support together
-    let supported_formats = surface.supported_formats(physical_device).unwrap_or(vec![]);
-
-    // if supported_formats is empty, it means we can choose freely
-    let default_format = *supported_formats.get(0).unwrap_or(&Format::Rgba8Srgb);
-
-    // try to find an srgb format, otherwise fallback to the first format we found above
-    supported_formats
-        .into_iter()
-        .find(|format| format.base_format().1 == ChannelType::Srgb)
-        .unwrap_or(default_format)
-}
-
-fn create_render_pass<B: gfx_hal::Backend>(
-    device: &B::Device,
-    surface_color_format: Format,
-) -> ManuallyDrop<B::RenderPass> {
-    // https://vulkan-tutorial.com/en/Drawing_a_triangle/Graphics_pipeline_basics/Render_passes
-    let color_attachment = Attachment {
-        format: Some(surface_color_format),
-        samples: 1, // no multi-sampling (yet)
-        ops: AttachmentOps::new(AttachmentLoadOp::Clear, AttachmentStoreOp::Store), // clear at start, store at end
-        stencil_ops: AttachmentOps::DONT_CARE, // no stencil usage yet
-        layouts: Layout::Undefined..Layout::Present, // don't mind layout at the start, but want to present at end
-    };
-
-    let subpass = SubpassDesc {
-        colors: &[(0, Layout::ColorAttachmentOptimal)],
-        depth_stencil: None,
-        inputs: &[],
-        resolves: &[],
-        preserves: &[],
-    };
-
-    ManuallyDrop::new(unsafe {
-        device
-            .create_render_pass(
-                iter::once(color_attachment),
-                iter::once(subpass),
-                iter::empty(),
-            )
-            .expect("Out of memory creating render pass")
-    })
-}
-
-fn compile_shader(glsl: &str, shader_kind: ShaderKind) -> Vec<u32> {
-    let mut compiler = shaderc::Compiler::new().unwrap();
-
-    let compiled_shader = compiler
-        .compile_into_spirv(glsl, shader_kind, "unnamed", "main", None)
-        .expect("Failed to compile shader");
-
-    compiled_shader.as_binary().to_vec()
-}
-
-unsafe fn make_pipeline<B: gfx_hal::Backend>(
-    device: &B::Device,
-    render_pass: &B::RenderPass,
-    pipeline_layout: &B::PipelineLayout,
-    vertex_shader: &str,
-    fragment_shader: &str,
-) -> ManuallyDrop<B::GraphicsPipeline> {
-    let vertex_shader_module = device
-        .create_shader_module(&compile_shader(vertex_shader, ShaderKind::Vertex))
-        .expect("Failed to create vertex shader module");
-
-    let fragment_shader_module = device
-        .create_shader_module(&compile_shader(fragment_shader, ShaderKind::Fragment))
-        .expect("Failed to create fragment shader module");
-
-    let (vs_entry, fs_entry) = (
-        EntryPoint {
-            entry: "main",
-            module: &vertex_shader_module,
-            specialization: Specialization::default(), // specializations can be used for constants later
-        },
-        EntryPoint {
-            entry: "main",
-            module: &fragment_shader_module,
-            specialization: Specialization::default(),
-        },
-    );
-
-    // https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Fixed_functions
-    let primitive_assembler = PrimitiveAssemblerDesc::Vertex {
-        buffers: &[],
-        attributes: &[],
-        input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
-        vertex: vs_entry,
-        tessellation: None,
-        geometry: None,
-    };
-
-    let mut pipeline_desc = GraphicsPipelineDesc::new(
-        primitive_assembler,
-        Rasterizer {
-            cull_face: Face::BACK,
-            ..Rasterizer::FILL // this is the struct update syntax
-        },
-        Some(fs_entry),
-        pipeline_layout,
-        Subpass {
-            index: 0,
-            main_pass: render_pass,
-        },
-    );
-
-    pipeline_desc.blender.targets.push(ColorBlendDesc {
-        mask: ColorMask::ALL,
-        blend: Some(BlendState::ALPHA),
-    });
-
-    let pipeline = device
-        .create_graphics_pipeline(&pipeline_desc, None)
-        .expect("Failed to create graphics pipeline");
-
-    // shader modules can be destroyed now, since the pipeline compiled
-    // them to machine code and we don't need the spir-v intermediate anymore
-    device.destroy_shader_module(vertex_shader_module);
-    device.destroy_shader_module(fragment_shader_module);
-    ManuallyDrop::new(pipeline)
 }
