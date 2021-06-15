@@ -275,6 +275,46 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     }
 }
 
+impl<B: gfx_hal::Backend> Drop for Renderer<B> {
+    fn drop(&mut self) {
+        // wait for device to become idle
+        self.device.wait_idle().unwrap();
+
+        unsafe {
+            // "drain" the vector, so that each value is dropped as we're iterating over it.
+            // we need to drop the values before we destroy further elements of the renderer
+            for command_pool in self.command_pools.drain(..) {
+                self.device.destroy_command_pool(command_pool);
+            }
+
+            for submission_complete_semaphore in self.submission_complete_semaphores.drain(..) {
+                self.device.destroy_semaphore(submission_complete_semaphore);
+            }
+
+            for submission_complete_fence in self.submission_complete_fences.drain(..) {
+                self.device.destroy_fence(submission_complete_fence);
+            }
+
+            self.device
+                .destroy_render_pass(ManuallyDrop::take(&mut self.render_pass));
+            self.device
+                .destroy_framebuffer(ManuallyDrop::take(&mut self.framebuffer));
+            self.surface.unconfigure_swapchain(&self.device);
+            self.device
+                .destroy_graphics_pipeline(ManuallyDrop::take(&mut self.pipeline));
+            self.device
+                .destroy_pipeline_layout(ManuallyDrop::take(&mut self.pipeline_layout));
+            self.instance
+                .destroy_surface(ManuallyDrop::take(&mut self.surface));
+
+            // at this point, every member in the struct gets dropped in order.
+            // however, when a ManuallyDrop is dropped, it's contents it points to won't be dropped!
+            // this is correct however, since we already passed ownership of all those values
+            // to these destroy_ functions and they then dropped those values for us already.
+        }
+    }
+}
+
 const APPLICATION_NAME: &'static str = "Rust Game Engine";
 const DEFAULT_WINDOW_SIZE: [u32; 2] = [512, 512];
 
@@ -328,6 +368,7 @@ fn main() {
     });
 }
 
+// todo: this might be needed again for proper dpi handling
 // fn get_window_sizes<T>(event_loop: &EventLoop<T>) -> (LogicalSize<u32>, PhysicalSize<u32>) {
 //     // get either the primary monitor's dpi or the
 //     // monitor with the highest dpi (on Wayland for example)
