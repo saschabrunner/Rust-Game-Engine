@@ -101,20 +101,27 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             )
         };
 
-        // framebuffer connects attachments to images
-        // attachments can be thought of as the slots
-        // and the images fill those slots
-        // todo: clean up the following code
-        // store and reuse the capabilities later and so on
-        let caps = surface.capabilities(&adapter.physical_device);
-        //let surface_extent = caps.current_extent.unwrap(); // todo: see if this works
-        let mut surface_extent = Extent2D {
+        let default_surface_extent = Extent2D {
             width: DEFAULT_WINDOW_SIZE[0],
             height: DEFAULT_WINDOW_SIZE[1],
         };
-        println!("{:?}", surface_extent); // todo: remove
-        let swapchain_config = SwapchainConfig::from_caps(&caps, surface_format, surface_extent);
-        surface_extent = swapchain_config.extent; // todo: document
+        let capabilities = surface.capabilities(&adapter.physical_device);
+        let swapchain_config =
+            SwapchainConfig::from_caps(&capabilities, surface_format, default_surface_extent);
+
+        // update surface extent, since the swapchain might enforce different dimensions
+        let surface_extent = swapchain_config.extent;
+
+        let viewport = Viewport {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: surface_extent.width as i16,
+                h: surface_extent.height as i16,
+            },
+            depth: 0.0..1.0,
+        };
+
         let framebuffer_attachment = swapchain_config.framebuffer_attachment();
 
         unsafe {
@@ -123,6 +130,9 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 .expect("Failed to configure swapchain");
         }
 
+        // framebuffer connects attachments to images
+        // attachments can be thought of as the slots
+        // and the images fill those slots
         let framebuffer = ManuallyDrop::new(unsafe {
             device
                 .create_framebuffer(
@@ -144,16 +154,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         let rendering_complete_semaphore = device
             .create_semaphore()
             .expect("Out of memory creating semaphore");
-
-        let viewport = Viewport {
-            rect: Rect {
-                x: 0,
-                y: 0,
-                w: surface_extent.width as i16,
-                h: surface_extent.height as i16,
-            },
-            depth: 0.0..1.0,
-        };
 
         Renderer {
             surface: ManuallyDrop::new(surface),
@@ -178,16 +178,33 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     }
 
     fn recreate_swapchain(&mut self) {
-        // todo: update according to example for better functionality and to avoid memory leaks
-        let caps = self.surface.capabilities(&self.adapter.physical_device);
-
+        let capabilities = self.surface.capabilities(&self.adapter.physical_device);
         let swapchain_config =
-            SwapchainConfig::from_caps(&caps, self.surface_format, self.surface_extent);
+            SwapchainConfig::from_caps(&capabilities, self.surface_format, self.surface_extent);
 
         // update surface extent, since the swapchain might enforce different dimensions
         self.surface_extent = swapchain_config.extent;
 
+        self.viewport.rect.w = self.surface_extent.width as i16;
+        self.viewport.rect.h = self.surface_extent.height as i16;
+
         unsafe {
+            self.device.wait_idle().unwrap();
+
+            // re-create framebuffer
+            self.device
+                .destroy_framebuffer(ManuallyDrop::take(&mut self.framebuffer));
+            self.framebuffer = ManuallyDrop::new(
+                self.device
+                    .create_framebuffer(
+                        &self.render_pass,
+                        iter::once(swapchain_config.framebuffer_attachment()),
+                        self.surface_extent.to_extent(),
+                    )
+                    .unwrap(),
+            );
+
+            // reconfigure swapchain
             self.surface
                 .configure_swapchain(&self.device, swapchain_config)
                 .expect("Failed to configure swapchain");
