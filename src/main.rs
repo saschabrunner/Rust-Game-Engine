@@ -1,7 +1,14 @@
-use std::{borrow::Borrow, io::Cursor, iter, mem::ManuallyDrop};
+use std::{
+    borrow::Borrow,
+    io::Cursor,
+    iter,
+    mem::{size_of, ManuallyDrop},
+    ptr,
+};
 
 use gfx_hal::{
-    adapter::{Adapter, PhysicalDevice},
+    adapter::{Adapter, MemoryType, PhysicalDevice},
+    buffer::{SubRange, Usage},
     command::{
         ClearColor, ClearValue, CommandBuffer, CommandBufferFlags, Level, RenderAttachmentInfo,
         SubpassContents,
@@ -9,16 +16,17 @@ use gfx_hal::{
     device::Device,
     format::{ChannelType, Format},
     image::{Extent, Layout},
+    memory::{self, Segment, SparseFlags},
     pass::{Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, Subpass, SubpassDesc},
     pool::{CommandPool, CommandPoolCreateFlags},
     pso::{
-        BlendState, ColorBlendDesc, ColorMask, EntryPoint, Face, GraphicsPipelineDesc,
-        InputAssemblerDesc, Primitive, PrimitiveAssemblerDesc, Rasterizer, Rect, Specialization,
-        Viewport,
+        self, AttributeDesc, BlendState, ColorBlendDesc, ColorMask, EntryPoint, Face,
+        GraphicsPipelineDesc, InputAssemblerDesc, Primitive, PrimitiveAssemblerDesc, Rasterizer,
+        Rect, Specialization, VertexBufferDesc, VertexInputRate, Viewport,
     },
     queue::{Queue, QueueFamily, QueueGroup},
     window::{Extent2D, PresentationSurface, Surface, SwapchainConfig},
-    Instance,
+    Instance, MemoryTypeId,
 };
 
 use winit::{
@@ -26,6 +34,13 @@ use winit::{
     event::{Event, WindowEvent},
     event_loop::ControlFlow,
 };
+
+// not dead code, we use memcpy on this struct
+#[allow(dead_code)]
+struct Vertex {
+    position: [f32; 2],
+    color: [f32; 3],
+}
 
 struct Renderer<B: gfx_hal::Backend> {
     surface: ManuallyDrop<B::Surface>,
@@ -41,6 +56,8 @@ struct Renderer<B: gfx_hal::Backend> {
     submission_complete_fences: Vec<B::Fence>,
     command_pools: Vec<B::CommandPool>,
     command_buffers: Vec<B::CommandBuffer>,
+    vertex_buffer: ManuallyDrop<B::Buffer>,
+    buffer_memory: ManuallyDrop<B::Memory>,
     frames_in_flight: usize,
     frame: u64,
     // these are dropped in the order they are declared, very important!
@@ -52,8 +69,13 @@ struct Renderer<B: gfx_hal::Backend> {
 
 impl<B: gfx_hal::Backend> Renderer<B> {
     pub fn new(instance: B::Instance, mut surface: B::Surface, adapter: Adapter<B>) -> Renderer<B> {
-        let queue_family = Self::find_queue_family(&adapter, &surface);
         let physical_device = &adapter.physical_device;
+        let limits = physical_device.properties().limits;
+        let memory_types = physical_device.memory_properties().memory_types;
+        // in the future I might also want to consider the memory_heaps field in the memory properties
+        // this will be useful to determine wheter the type belongs to the GPUs VRAM or might be slow system RAM
+
+        let queue_family = Self::find_queue_family(&adapter, &surface);
 
         let mut gpu = unsafe {
             physical_device
@@ -63,6 +85,56 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         let device = gpu.device;
         let queue_group = gpu.queue_groups.pop().unwrap();
+
+        let buffer_stride = size_of::<Vertex>();
+        let buffer_len = QUAD.len() * buffer_stride;
+        // buffer needs to have size that's a multiple of non_coherent_atom_size for it to be mapped
+        let padded_buffer_len = (buffer_len + limits.non_coherent_atom_size - 1)
+            / limits.non_coherent_atom_size
+            * limits.non_coherent_atom_size;
+
+        let mut vertex_buffer = ManuallyDrop::new(
+            unsafe {
+                device.create_buffer(
+                    padded_buffer_len as u64,
+                    Usage::VERTEX,
+                    SparseFlags::empty(),
+                )
+            }
+            .unwrap(),
+        );
+
+        let buffer_requirements = unsafe { device.get_buffer_requirements(&vertex_buffer) };
+
+        let buffer_memory_type = Self::find_memory_type(
+            &memory_types,
+            buffer_requirements.type_mask,
+            memory::Properties::CPU_VISIBLE,
+        );
+
+        // allocate memory, map it, copy data into it and unmap it
+        let buffer_memory = unsafe {
+            let mut memory = device
+                .allocate_memory(buffer_memory_type, buffer_requirements.size)
+                .unwrap();
+            device
+                .bind_buffer_memory(&memory, 0, &mut vertex_buffer)
+                .unwrap();
+            let mapping = device.map_memory(&mut memory, Segment::ALL).unwrap();
+            ptr::copy_nonoverlapping(QUAD.as_ptr() as *const u8, mapping, buffer_len);
+
+            // manually flush the memory, so that it is ensured to be available to the GPU.
+            // if instead limited buffer_memory_type to a type that contains the property
+            // memory::Properties::COHERENT, we wouldn't have to explicitly flush.
+            // either way however, the memory is not guaranteed to be visible on the GPU yet
+            // until we submit our queue, according to the specification.
+            device
+                .flush_mapped_memory_ranges(iter::once((&memory, Segment::ALL)))
+                .unwrap();
+
+            device.unmap_memory(&mut memory);
+            ManuallyDrop::new(memory)
+        };
 
         // limit amount of frames calculated simultaneously to avoid the CPU outrunning the GPU
         let frames_in_flight = 3;
@@ -106,11 +178,11 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // shaders are compiled by build script
         let vertex_shader = gfx_auxil::read_spirv(Cursor::new(include_bytes!(
-            "../target/data/shaders/01_triangle.vert.spv"
+            "../target/data/shaders/02_pos_color.vert.spv"
         )))
         .unwrap();
         let fragment_shader = gfx_auxil::read_spirv(Cursor::new(include_bytes!(
-            "../target/data/shaders/01_single_color.frag.spv"
+            "../target/data/shaders/02_vertex_color.frag.spv"
         )))
         .unwrap();
 
@@ -185,6 +257,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             submission_complete_fences,
             command_pools,
             command_buffers,
+            vertex_buffer,
+            buffer_memory,
             frames_in_flight,
             frame: 0,
             device,
@@ -281,7 +355,9 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             );
 
             command_buffer.bind_graphics_pipeline(&self.pipeline);
-            command_buffer.draw(0..3, 0..1);
+            command_buffer
+                .bind_vertex_buffers(0, iter::once((&*self.vertex_buffer, SubRange::WHOLE)));
+            command_buffer.draw(0..QUAD.len() as u32, 0..1);
             command_buffer.end_render_pass();
             command_buffer.finish();
 
@@ -326,6 +402,25 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             .find(|format| format.base_format().1 == ChannelType::Srgb)
             .unwrap_or(default_format)
     }
+
+    fn find_memory_type(
+        memory_types: &[MemoryType],
+        requirements_type_mask: u32,
+        required_properties: memory::Properties,
+    ) -> MemoryTypeId {
+        memory_types
+            .iter()
+            .enumerate()
+            .position(|(id, memory_type)| {
+                // shift one bit and use bitwise and to find the first memory type that
+                // is usable and has the required properties
+                requirements_type_mask & (1 << id) != 0
+                    && memory_type.properties.contains(required_properties)
+            })
+            .unwrap()
+            .into()
+    }
+
     fn create_render_pass(
         device: &B::Device,
         surface_color_format: Format,
@@ -388,8 +483,29 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Fixed_functions
         let primitive_assembler = PrimitiveAssemblerDesc::Vertex {
-            buffers: &[],
-            attributes: &[],
+            buffers: &[VertexBufferDesc {
+                binding: 0,
+                stride: size_of::<Vertex>() as u32,
+                rate: VertexInputRate::Vertex,
+            }],
+            attributes: &[
+                AttributeDesc {
+                    location: 0,
+                    binding: 0, // is equal to the number in the VertexBufferDesc
+                    element: pso::Element {
+                        format: Format::Rg32Sfloat,
+                        offset: 0,
+                    },
+                },
+                AttributeDesc {
+                    location: 1,
+                    binding: 0,
+                    element: pso::Element {
+                        format: Format::Rgb32Sfloat,
+                        offset: 8, // an offset_of library or offset_from may be considered here
+                    },
+                },
+            ],
             input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
             vertex: vs_entry,
             tessellation: None,
@@ -449,6 +565,10 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
             }
 
             self.device
+                .destroy_buffer(ManuallyDrop::take(&mut self.vertex_buffer));
+            self.device
+                .free_memory(ManuallyDrop::take(&mut self.buffer_memory));
+            self.device
                 .destroy_render_pass(ManuallyDrop::take(&mut self.render_pass));
             self.device
                 .destroy_framebuffer(ManuallyDrop::take(&mut self.framebuffer));
@@ -470,6 +590,17 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
 
 const APPLICATION_NAME: &'static str = "Rust Game Engine";
 const DEFAULT_WINDOW_SIZE: [u32; 2] = [512, 512];
+
+#[cfg_attr(rustfmt, rustfmt_skip)]
+const QUAD: [Vertex; 6] = [
+    Vertex { position: [-0.5, -0.5], color: [1.0, 1.0, 1.0] },
+    Vertex { position: [-0.5,  0.5], color: [0.0, 1.0, 1.0] },
+    Vertex { position: [ 0.5,  0.5], color: [1.0, 0.0, 1.0] },
+
+    Vertex { position: [-0.5, -0.5], color: [1.0, 1.0, 0.0] },
+    Vertex { position: [ 0.5,  0.5], color: [1.0, 0.0, 1.0] },
+    Vertex { position: [ 0.5, -0.5], color: [0.0, 1.0, 1.0] },
+];
 
 fn main() {
     let event_loop = winit::event_loop::EventLoop::new();
