@@ -37,7 +37,7 @@ struct Renderer<B: gfx_hal::Backend> {
     render_pass: ManuallyDrop<B::RenderPass>,
     framebuffer: ManuallyDrop<B::Framebuffer>,
     pipeline: ManuallyDrop<B::GraphicsPipeline>,
-    pipeline_layout: ManuallyDrop<B::PipelineLayout>, // todo: is this needed here?
+    pipeline_layout: ManuallyDrop<B::PipelineLayout>,
     //pipeline_cache: ManuallyDrop<B::PipelineCache> // todo: should I add this?
     submission_complete_semaphores: Vec<B::Semaphore>,
     submission_complete_fences: Vec<B::Fence>,
@@ -53,12 +53,7 @@ struct Renderer<B: gfx_hal::Backend> {
 }
 
 impl<B: gfx_hal::Backend> Renderer<B> {
-    pub fn new(
-        instance: B::Instance,
-        mut surface: B::Surface,
-        //surface_extent: Extent2D, todo: might not need that due to use of capabilities
-        adapter: Adapter<B>,
-    ) -> Renderer<B> {
+    pub fn new(instance: B::Instance, mut surface: B::Surface, adapter: Adapter<B>) -> Renderer<B> {
         let queue_family = Self::find_queue_family(&adapter, &surface);
         let physical_device = &adapter.physical_device;
 
@@ -71,14 +66,35 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         let device = gpu.device;
         let queue_group = gpu.queue_groups.pop().unwrap();
 
-        // a command pool allocates command buffers and is supposed to be used from a single thread only
-        let mut command_pool = unsafe {
-            device.create_command_pool(queue_group.family, CommandPoolCreateFlags::empty())
-        }
-        .expect("Out of memory creating command pool");
+        // limit amount of frames calculated simultaneously to avoid the CPU outrunning the GPU
+        let frames_in_flight = 3;
 
-        // mutable access to command_pool required here
-        let command_buffer = unsafe { command_pool.allocate_one(Level::Primary) };
+        let mut command_pools = Vec::with_capacity(frames_in_flight);
+        let mut command_buffers = Vec::with_capacity(frames_in_flight);
+        let mut submission_complete_semaphores = Vec::with_capacity(frames_in_flight);
+        let mut submission_complete_fences = Vec::with_capacity(frames_in_flight);
+
+        for _ in 0..frames_in_flight {
+            unsafe {
+                // a command pool allocates command buffers and is supposed to be used from a single thread only
+                let mut command_pool = device
+                    .create_command_pool(queue_group.family, CommandPoolCreateFlags::empty())
+                    .expect("Out of memory creating command pool");
+
+                command_buffers.push(command_pool.allocate_one(Level::Primary));
+                command_pools.push(command_pool);
+                submission_complete_semaphores.push(
+                    device
+                        .create_semaphore()
+                        .expect("Out of memory creating semaphore"),
+                );
+                submission_complete_fences.push(
+                    device
+                        .create_fence(true)
+                        .expect("Out of memory creating fence"),
+                );
+            }
+        }
 
         let surface_format = Self::find_surface_format(physical_device, &surface);
         let render_pass = Self::create_render_pass(&device, surface_format);
@@ -147,14 +163,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 .unwrap()
         });
 
-        let submission_complete_fence = device
-            .create_fence(true)
-            .expect("Out of memory creating fence");
-
-        let rendering_complete_semaphore = device
-            .create_semaphore()
-            .expect("Out of memory creating semaphore");
-
         Renderer {
             surface: ManuallyDrop::new(surface),
             surface_format,
@@ -164,11 +172,11 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             framebuffer,
             pipeline,
             pipeline_layout,
-            submission_complete_semaphores: vec![rendering_complete_semaphore], //todo: rename
-            submission_complete_fences: vec![submission_complete_fence],
-            command_pools: vec![command_pool],
-            command_buffers: vec![command_buffer],
-            frames_in_flight: 1, //todo
+            submission_complete_semaphores,
+            submission_complete_fences,
+            command_pools,
+            command_buffers,
+            frames_in_flight,
             frame: 0,
             device,
             adapter,
@@ -212,27 +220,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     }
 
     pub fn render(&mut self) {
-        // todo: support multiple of these
-        let submission_complete_fence = &mut self.submission_complete_fences[0];
-        let submission_complete_semaphore = &mut self.submission_complete_semaphores[0];
-        let command_pool = &mut self.command_pools[0];
-        let command_buffer = &mut self.command_buffers[0];
-
-        unsafe {
-            // wait for the last submission to finish before resetting command pool and preparing new frame
-            let render_timeout_ns = 1_000_000_000;
-            self.device
-                .wait_for_fence(submission_complete_fence, render_timeout_ns)
-                .expect("Out of memory or device lost waiting for fence");
-            self.device
-                .reset_fence(submission_complete_fence)
-                .expect("Out of memory resetting fence");
-            command_pool.reset(false);
-        }
-
         let surface_image = unsafe {
             let acquire_timeout_ns = 1_000_000_000;
-
             match self.surface.acquire_image(acquire_timeout_ns) {
                 Ok((image, _)) => image,
                 Err(_) => {
@@ -243,6 +232,23 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             }
         };
 
+        let frame_id = (self.frame % self.frames_in_flight as u64) as usize;
+        unsafe {
+            // wait for the last submission to finish before resetting command pool and preparing new frame
+            let render_timeout_ns = 1_000_000_000;
+            self.device
+                .wait_for_fence(
+                    &self.submission_complete_fences[frame_id],
+                    render_timeout_ns,
+                )
+                .expect("Out of memory or device lost waiting for fence");
+            self.device
+                .reset_fence(&mut self.submission_complete_fences[frame_id])
+                .expect("Out of memory resetting fence");
+            self.command_pools[frame_id].reset(false);
+        }
+
+        let command_buffer = &mut self.command_buffers[frame_id];
         unsafe {
             command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
             // viewports and scissors are part of the command buffer, different to Vulkan
@@ -269,26 +275,25 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             command_buffer.draw(0..3, 0..1);
             command_buffer.end_render_pass();
             command_buffer.finish();
-        }
 
-        unsafe {
             self.queue_group.queues[0].submit(
                 iter::once(&*command_buffer),
                 iter::empty(),
-                iter::once(&*submission_complete_semaphore),
-                Some(submission_complete_fence),
+                iter::once(&self.submission_complete_semaphores[frame_id]),
+                Some(&mut self.submission_complete_fences[frame_id]),
             );
-
             let result = self.queue_group.queues[0].present(
                 &mut self.surface,
                 surface_image,
-                Some(submission_complete_semaphore),
+                Some(&mut self.submission_complete_semaphores[frame_id]),
             );
 
             if result.is_err() {
                 self.recreate_swapchain();
             }
         }
+
+        self.frame += 1;
     }
 
     fn find_queue_family<'a>(adapter: &'a Adapter<B>, surface: &B::Surface) -> &'a B::QueueFamily {
