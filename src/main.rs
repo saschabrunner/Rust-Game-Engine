@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, iter, mem::ManuallyDrop};
+use std::{borrow::Borrow, io::Cursor, iter, mem::ManuallyDrop};
 
 use gfx_hal::{
     adapter::{Adapter, PhysicalDevice},
@@ -20,8 +20,6 @@ use gfx_hal::{
     window::{Extent2D, PresentationSurface, Surface, SwapchainConfig},
     Instance,
 };
-
-use shaderc::ShaderKind;
 
 use winit::{
     dpi::LogicalSize,
@@ -105,15 +103,24 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 .create_pipeline_layout(iter::empty(), iter::empty())
                 .expect("Out of memory creating pipeline layout")
         });
-        let vertex_shader = include_str!("../data/shaders/01_triangle.vert");
-        let fragment_shader = include_str!("../data/shaders/01_single_color.frag");
+
+        // shaders are compiled by build script
+        let vertex_shader = gfx_auxil::read_spirv(Cursor::new(include_bytes!(
+            "../target/data/shaders/01_triangle.vert.spv"
+        )))
+        .unwrap();
+        let fragment_shader = gfx_auxil::read_spirv(Cursor::new(include_bytes!(
+            "../target/data/shaders/01_single_color.frag.spv"
+        )))
+        .unwrap();
+
         let pipeline = unsafe {
             Self::make_pipeline(
                 &device,
                 &render_pass,
                 &*pipeline_layout,
-                vertex_shader,
-                fragment_shader,
+                &vertex_shader,
+                &fragment_shader,
             )
         };
 
@@ -148,7 +155,9 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // framebuffer connects attachments to images
         // attachments can be thought of as the slots
-        // and the images fill those slots
+        // and the images fill those slots.
+        // gfx-rs uses imageless framebuffers,
+        // we don't have to recreate them every frame.
         let framebuffer = ManuallyDrop::new(unsafe {
             device
                 .create_framebuffer(
@@ -348,26 +357,20 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 .expect("Out of memory creating render pass")
         })
     }
-    fn compile_shader(glsl: &str, shader_kind: ShaderKind) -> Vec<u32> {
-        let mut compiler = shaderc::Compiler::new().unwrap();
-        let compiled_shader = compiler
-            .compile_into_spirv(glsl, shader_kind, "unnamed", "main", None)
-            .expect("Failed to compile shader");
-        compiled_shader.as_binary().to_vec()
-    }
+
     unsafe fn make_pipeline(
         device: &B::Device,
         render_pass: &B::RenderPass,
         pipeline_layout: &B::PipelineLayout,
-        vertex_shader: &str,
-        fragment_shader: &str,
+        vertex_shader: &[u32],
+        fragment_shader: &[u32],
     ) -> ManuallyDrop<B::GraphicsPipeline> {
         let vertex_shader_module = device
-            .create_shader_module(&Self::compile_shader(vertex_shader, ShaderKind::Vertex))
+            .create_shader_module(vertex_shader)
             .expect("Failed to create vertex shader module");
 
         let fragment_shader_module = device
-            .create_shader_module(&Self::compile_shader(fragment_shader, ShaderKind::Fragment))
+            .create_shader_module(fragment_shader)
             .expect("Failed to create fragment shader module");
 
         let (vs_entry, fs_entry) = (
