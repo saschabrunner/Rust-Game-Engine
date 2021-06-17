@@ -26,7 +26,7 @@ use gfx_hal::{
     },
     queue::{Queue, QueueFamily, QueueGroup},
     window::{Extent2D, PresentationSurface, Surface, SwapchainConfig},
-    Instance, MemoryTypeId,
+    IndexType, Instance, MemoryTypeId,
 };
 
 use winit::{
@@ -57,7 +57,9 @@ struct Renderer<B: gfx_hal::Backend> {
     command_pools: Vec<B::CommandPool>,
     command_buffers: Vec<B::CommandBuffer>,
     vertex_buffer: ManuallyDrop<B::Buffer>,
-    buffer_memory: ManuallyDrop<B::Memory>,
+    index_buffer: ManuallyDrop<B::Buffer>,
+    vertex_buffer_memory: ManuallyDrop<B::Memory>,
+    index_buffer_memory: ManuallyDrop<B::Memory>,
     frames_in_flight: usize,
     frame: u64,
     // these are dropped in the order they are declared, very important!
@@ -86,55 +88,11 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         let device = gpu.device;
         let queue_group = gpu.queue_groups.pop().unwrap();
 
-        let buffer_stride = size_of::<Vertex>();
-        let buffer_len = QUAD.len() * buffer_stride;
-        // buffer needs to have size that's a multiple of non_coherent_atom_size for it to be mapped
-        let padded_buffer_len = (buffer_len + limits.non_coherent_atom_size - 1)
-            / limits.non_coherent_atom_size
-            * limits.non_coherent_atom_size;
+        let (vertex_buffer, vertex_buffer_memory) =
+            Self::create_vertex_buffer(&device, &limits, &memory_types);
 
-        let mut vertex_buffer = ManuallyDrop::new(
-            unsafe {
-                device.create_buffer(
-                    padded_buffer_len as u64,
-                    Usage::VERTEX,
-                    SparseFlags::empty(),
-                )
-            }
-            .unwrap(),
-        );
-
-        let buffer_requirements = unsafe { device.get_buffer_requirements(&vertex_buffer) };
-
-        let buffer_memory_type = Self::find_memory_type(
-            &memory_types,
-            buffer_requirements.type_mask,
-            memory::Properties::CPU_VISIBLE,
-        );
-
-        // allocate memory, map it, copy data into it and unmap it
-        let buffer_memory = unsafe {
-            let mut memory = device
-                .allocate_memory(buffer_memory_type, buffer_requirements.size)
-                .unwrap();
-            device
-                .bind_buffer_memory(&memory, 0, &mut vertex_buffer)
-                .unwrap();
-            let mapping = device.map_memory(&mut memory, Segment::ALL).unwrap();
-            ptr::copy_nonoverlapping(QUAD.as_ptr() as *const u8, mapping, buffer_len);
-
-            // manually flush the memory, so that it is ensured to be available to the GPU.
-            // if instead limited buffer_memory_type to a type that contains the property
-            // memory::Properties::COHERENT, we wouldn't have to explicitly flush.
-            // either way however, the memory is not guaranteed to be visible on the GPU yet
-            // until we submit our queue, according to the specification.
-            device
-                .flush_mapped_memory_ranges(iter::once((&memory, Segment::ALL)))
-                .unwrap();
-
-            device.unmap_memory(&mut memory);
-            ManuallyDrop::new(memory)
-        };
+        let (index_buffer, index_buffer_memory) =
+            Self::create_index_buffer(&device, &limits, &memory_types);
 
         // limit amount of frames calculated simultaneously to avoid the CPU outrunning the GPU
         let frames_in_flight = 3;
@@ -258,7 +216,9 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             command_pools,
             command_buffers,
             vertex_buffer,
-            buffer_memory,
+            index_buffer,
+            vertex_buffer_memory,
+            index_buffer_memory,
             frames_in_flight,
             frame: 0,
             device,
@@ -357,7 +317,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             command_buffer.bind_graphics_pipeline(&self.pipeline);
             command_buffer
                 .bind_vertex_buffers(0, iter::once((&*self.vertex_buffer, SubRange::WHOLE)));
-            command_buffer.draw(0..QUAD.len() as u32, 0..1);
+            command_buffer.bind_index_buffer(&*self.index_buffer, SubRange::WHOLE, IndexType::U16);
+            command_buffer.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
             command_buffer.end_render_pass();
             command_buffer.finish();
 
@@ -401,6 +362,107 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             .into_iter()
             .find(|format| format.base_format().1 == ChannelType::Srgb)
             .unwrap_or(default_format)
+    }
+
+    fn create_vertex_buffer(
+        device: &B::Device,
+        limits: &gfx_hal::Limits,
+        memory_types: &[MemoryType],
+    ) -> (ManuallyDrop<B::Buffer>, ManuallyDrop<B::Memory>) {
+        let buffer_stride = size_of::<Vertex>();
+        let buffer_len = VERTICES.len() * buffer_stride;
+        // buffer needs to have size that's a multiple of non_coherent_atom_size for it to be mapped
+        let padded_buffer_len = (buffer_len + limits.non_coherent_atom_size - 1)
+            / limits.non_coherent_atom_size
+            * limits.non_coherent_atom_size;
+
+        let mut buffer = ManuallyDrop::new(
+            unsafe {
+                device.create_buffer(
+                    padded_buffer_len as u64,
+                    Usage::VERTEX,
+                    SparseFlags::empty(),
+                )
+            }
+            .unwrap(),
+        );
+
+        let buffer_requirements = unsafe { device.get_buffer_requirements(&buffer) };
+
+        let buffer_memory_type = Self::find_memory_type(
+            &memory_types,
+            buffer_requirements.type_mask,
+            memory::Properties::CPU_VISIBLE,
+        );
+
+        // allocate memory, map it, copy data into it and unmap it
+        let memory = unsafe {
+            let mut memory = device
+                .allocate_memory(buffer_memory_type, buffer_requirements.size)
+                .unwrap();
+            device.bind_buffer_memory(&memory, 0, &mut buffer).unwrap();
+            let mapping = device.map_memory(&mut memory, Segment::ALL).unwrap();
+            ptr::copy_nonoverlapping(VERTICES.as_ptr() as *const u8, mapping, buffer_len);
+
+            // manually flush the memory, so that it is ensured to be available to the GPU.
+            // if instead limited buffer_memory_type to a type that contains the property
+            // memory::Properties::COHERENT, we wouldn't have to explicitly flush.
+            // either way however, the memory is not guaranteed to be visible on the GPU yet
+            // until we submit our queue, according to the specification.
+            device
+                .flush_mapped_memory_ranges(iter::once((&memory, Segment::ALL)))
+                .unwrap();
+
+            device.unmap_memory(&mut memory);
+            ManuallyDrop::new(memory)
+        };
+
+        (buffer, memory)
+    }
+
+    fn create_index_buffer(
+        device: &B::Device,
+        limits: &gfx_hal::Limits,
+        memory_types: &[MemoryType],
+    ) -> (ManuallyDrop<B::Buffer>, ManuallyDrop<B::Memory>) {
+        let buffer_stride = size_of::<u16>();
+        let buffer_len = INDICES.len() * buffer_stride;
+        let padded_buffer_len = (buffer_len + limits.non_coherent_atom_size - 1)
+            / limits.non_coherent_atom_size
+            * limits.non_coherent_atom_size;
+
+        let mut buffer = ManuallyDrop::new(
+            unsafe {
+                device.create_buffer(padded_buffer_len as u64, Usage::INDEX, SparseFlags::empty())
+            }
+            .unwrap(),
+        );
+
+        let buffer_requirements = unsafe { device.get_buffer_requirements(&buffer) };
+
+        let buffer_memory_type = Self::find_memory_type(
+            &memory_types,
+            buffer_requirements.type_mask,
+            memory::Properties::CPU_VISIBLE,
+        );
+
+        let memory = unsafe {
+            let mut memory = device
+                .allocate_memory(buffer_memory_type, buffer_requirements.size)
+                .unwrap();
+            device.bind_buffer_memory(&memory, 0, &mut buffer).unwrap();
+            let mapping = device.map_memory(&mut memory, Segment::ALL).unwrap();
+            ptr::copy_nonoverlapping(INDICES.as_ptr() as *const u8, mapping, buffer_len);
+
+            device
+                .flush_mapped_memory_ranges(iter::once((&memory, Segment::ALL)))
+                .unwrap();
+
+            device.unmap_memory(&mut memory);
+            ManuallyDrop::new(memory)
+        };
+
+        (buffer, memory)
     }
 
     fn find_memory_type(
@@ -567,7 +629,11 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
             self.device
                 .destroy_buffer(ManuallyDrop::take(&mut self.vertex_buffer));
             self.device
-                .free_memory(ManuallyDrop::take(&mut self.buffer_memory));
+                .destroy_buffer(ManuallyDrop::take(&mut self.index_buffer));
+            self.device
+                .free_memory(ManuallyDrop::take(&mut self.vertex_buffer_memory));
+            self.device
+                .free_memory(ManuallyDrop::take(&mut self.index_buffer_memory));
             self.device
                 .destroy_render_pass(ManuallyDrop::take(&mut self.render_pass));
             self.device
@@ -592,15 +658,14 @@ const APPLICATION_NAME: &'static str = "Rust Game Engine";
 const DEFAULT_WINDOW_SIZE: [u32; 2] = [512, 512];
 
 #[cfg_attr(rustfmt, rustfmt_skip)]
-const QUAD: [Vertex; 6] = [
+const VERTICES: [Vertex; 4] = [
     Vertex { position: [-0.5, -0.5], color: [1.0, 1.0, 1.0] },
     Vertex { position: [-0.5,  0.5], color: [0.0, 1.0, 1.0] },
     Vertex { position: [ 0.5,  0.5], color: [1.0, 0.0, 1.0] },
-
-    Vertex { position: [-0.5, -0.5], color: [1.0, 1.0, 0.0] },
-    Vertex { position: [ 0.5,  0.5], color: [1.0, 0.0, 1.0] },
     Vertex { position: [ 0.5, -0.5], color: [0.0, 1.0, 1.0] },
 ];
+
+const INDICES: [u16; 6] = [0, 1, 2, 0, 2, 3];
 
 fn main() {
     let event_loop = winit::event_loop::EventLoop::new();
