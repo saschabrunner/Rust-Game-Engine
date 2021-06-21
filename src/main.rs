@@ -4,6 +4,7 @@ use std::{
     iter,
     mem::{size_of, ManuallyDrop},
     ptr,
+    time::Instant,
 };
 
 use gfx_hal::{
@@ -20,14 +21,19 @@ use gfx_hal::{
     pass::{Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, Subpass, SubpassDesc},
     pool::{CommandPool, CommandPoolCreateFlags},
     pso::{
-        self, AttributeDesc, BlendState, ColorBlendDesc, ColorMask, EntryPoint, Face,
-        GraphicsPipelineDesc, InputAssemblerDesc, Primitive, PrimitiveAssemblerDesc, Rasterizer,
-        Rect, Specialization, VertexBufferDesc, VertexInputRate, Viewport,
+        self, AttributeDesc, BlendState, BufferDescriptorFormat, BufferDescriptorType,
+        ColorBlendDesc, ColorMask, Descriptor, DescriptorPool, DescriptorPoolCreateFlags,
+        DescriptorRangeDesc, DescriptorSetLayoutBinding, DescriptorSetWrite, DescriptorType,
+        EntryPoint, Face, GraphicsPipelineDesc, InputAssemblerDesc, Primitive,
+        PrimitiveAssemblerDesc, Rasterizer, Rect, ShaderStageFlags, Specialization,
+        VertexBufferDesc, VertexInputRate, Viewport,
     },
     queue::{Queue, QueueFamily, QueueGroup},
     window::{Extent2D, PresentationSurface, Surface, SwapchainConfig},
     IndexType, Instance, MemoryTypeId,
 };
+
+use nalgebra::{Matrix4, Point3, Vector3};
 
 use winit::{
     dpi::LogicalSize,
@@ -35,11 +41,18 @@ use winit::{
     event_loop::ControlFlow,
 };
 
-// not dead code, we use memcpy on this struct
+// not dead code, we use memcpy on these structs
 #[allow(dead_code)]
 struct Vertex {
     position: [f32; 2],
     color: [f32; 3],
+}
+
+#[allow(dead_code)]
+struct Transformations {
+    model: Matrix4<f32>,
+    view: Matrix4<f32>,
+    projection: Matrix4<f32>,
 }
 
 struct Renderer<B: gfx_hal::Backend> {
@@ -58,10 +71,16 @@ struct Renderer<B: gfx_hal::Backend> {
     command_buffers: Vec<B::CommandBuffer>,
     vertex_buffer: ManuallyDrop<B::Buffer>,
     index_buffer: ManuallyDrop<B::Buffer>,
+    uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
     vertex_buffer_memory: ManuallyDrop<B::Memory>,
     index_buffer_memory: ManuallyDrop<B::Memory>,
+    uniform_buffers_memory: Vec<ManuallyDrop<B::Memory>>,
+    descriptor_set_layout: ManuallyDrop<B::DescriptorSetLayout>,
+    descriptor_pool: ManuallyDrop<B::DescriptorPool>,
+    descriptor_sets: Vec<B::DescriptorSet>,
     frames_in_flight: usize,
     frame: u64,
+    start_time: Instant,
     // these are dropped in the order they are declared, very important!
     device: B::Device,
     adapter: Adapter<B>,
@@ -127,16 +146,96 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         let surface_format = Self::find_surface_format(physical_device, &surface);
         let render_pass = Self::create_render_pass(&device, surface_format);
 
+        let descriptor_set_layout = ManuallyDrop::new(
+            unsafe {
+                device.create_descriptor_set_layout(
+                    iter::once(DescriptorSetLayoutBinding {
+                        binding: 0,
+                        ty: DescriptorType::Buffer {
+                            ty: BufferDescriptorType::Uniform,
+                            format: BufferDescriptorFormat::Structured {
+                                dynamic_offset: false,
+                            },
+                        },
+                        count: 1,
+                        stage_flags: ShaderStageFlags::VERTEX,
+                        immutable_samplers: false,
+                    }),
+                    iter::empty(),
+                )
+            }
+            .expect("Out of memory creating descriptor set layout"),
+        );
+
+        let mut uniform_buffers = Vec::with_capacity(frames_in_flight);
+        let mut uniform_buffers_memory = Vec::with_capacity(frames_in_flight);
+        let padded_length = ((size_of::<Transformations>() + limits.non_coherent_atom_size - 1)
+            / limits.non_coherent_atom_size
+            * limits.non_coherent_atom_size) as u64;
+        for _ in 0..frames_in_flight {
+            let (uniform_buffer, uniform_buffer_memory) = Self::create_buffer(
+                &device,
+                &memory_types,
+                padded_length,
+                Usage::UNIFORM,
+                memory::Properties::CPU_VISIBLE,
+            );
+            uniform_buffers.push(uniform_buffer);
+            uniform_buffers_memory.push(uniform_buffer_memory);
+        }
+
+        let mut descriptor_pool = ManuallyDrop::new(
+            unsafe {
+                device.create_descriptor_pool(
+                    frames_in_flight,
+                    iter::once(DescriptorRangeDesc {
+                        ty: DescriptorType::Buffer {
+                            // TODO: Don't duplicate that
+                            ty: BufferDescriptorType::Uniform,
+                            format: BufferDescriptorFormat::Structured {
+                                dynamic_offset: false,
+                            },
+                        },
+                        count: frames_in_flight,
+                    }),
+                    DescriptorPoolCreateFlags::empty(),
+                )
+            }
+            .expect("Out of memory creating descriptor pool"),
+        );
+
+        let mut descriptor_sets = Vec::with_capacity(frames_in_flight);
+        let mut cloned_layouts = Vec::with_capacity(frames_in_flight);
+        for _ in 0..frames_in_flight {
+            cloned_layouts.push(&*descriptor_set_layout);
+        }
+        unsafe { descriptor_pool.allocate(cloned_layouts.into_iter(), &mut descriptor_sets) }
+            .unwrap();
+
+        for i in 0..frames_in_flight {
+            unsafe {
+                device.write_descriptor_set(DescriptorSetWrite {
+                    set: &mut descriptor_sets[i],
+                    binding: 0,
+                    array_offset: 0,
+                    descriptors: iter::once(Descriptor::Buffer(
+                        &*uniform_buffers[i],
+                        SubRange::WHOLE,
+                    )),
+                })
+            }
+        }
+
         // used for uniforms and push constants in the future
         let pipeline_layout = ManuallyDrop::new(unsafe {
             device
-                .create_pipeline_layout(iter::empty(), iter::empty())
+                .create_pipeline_layout(iter::once(&*descriptor_set_layout), iter::empty())
                 .expect("Out of memory creating pipeline layout")
         });
 
         // shaders are compiled by build script
         let vertex_shader = gfx_auxil::read_spirv(Cursor::new(include_bytes!(
-            "../target/data/shaders/02_pos_color.vert.spv"
+            "../target/data/shaders/02_model_view_projection.vert.spv"
         )))
         .unwrap();
         let fragment_shader = gfx_auxil::read_spirv(Cursor::new(include_bytes!(
@@ -217,10 +316,16 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             command_buffers,
             vertex_buffer,
             index_buffer,
+            uniform_buffers,
             vertex_buffer_memory,
             index_buffer_memory,
+            uniform_buffers_memory,
+            descriptor_set_layout,
+            descriptor_pool,
+            descriptor_sets,
             frames_in_flight,
             frame: 0,
+            start_time: Instant::now(),
             device,
             adapter,
             queue_group,
@@ -269,7 +374,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 Ok((image, _)) => image,
                 Err(_) => {
                     self.recreate_swapchain();
-                    //should_configure_swapchain = true;
                     return;
                 }
             }
@@ -277,7 +381,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         let frame_id = (self.frame % self.frames_in_flight as u64) as usize;
         unsafe {
-            // wait for the last submission to finish before resetting command pool and preparing new frame
+            // wait for the previous submission to finish before resetting command pool and preparing new frame
             let render_timeout_ns = 1_000_000_000;
             self.device
                 .wait_for_fence(
@@ -291,12 +395,70 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             self.command_pools[frame_id].reset(false);
         }
 
+        // rotate model with time
+        let time = self.start_time.elapsed().as_secs_f32();
+        let model = Matrix4::<f32>::from_euler_angles(0.0, 0.0, time);
+
+        // place camera 2 units back and 1 each below and to the right, pointing at 0,0,0
+        let view = Matrix4::<f32>::look_at_rh(
+            &Point3::new(1.0, 1.0, 2.0),
+            &Point3::new(0.0, 0.0, 0.0),
+            &Vector3::new(0.0, 1.0, 0.0),
+        );
+
+        let projection = Matrix4::<f32>::new_perspective(
+            self.surface_extent.width as f32 / self.surface_extent.height as f32,
+            0.9, // around 50° vertical fov
+            0.1,
+            10.0,
+        );
+
+        let transformations = Transformations {
+            model,
+            view,
+            projection,
+        };
+
+        // copy data into uniform buffer
+        unsafe {
+            let mapping = self
+                .device
+                .map_memory(&mut self.uniform_buffers_memory[frame_id], Segment::ALL)
+                .unwrap();
+            ptr::copy_nonoverlapping(
+                &transformations as *const Transformations as *const u8,
+                mapping,
+                size_of::<Transformations>(),
+            );
+
+            self.device
+                .flush_mapped_memory_ranges(iter::once((
+                    &*self.uniform_buffers_memory[frame_id],
+                    Segment::ALL,
+                )))
+                .unwrap();
+
+            self.device
+                .unmap_memory(&mut self.uniform_buffers_memory[frame_id]);
+        };
+
         let command_buffer = &mut self.command_buffers[frame_id];
         unsafe {
             command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
             // viewports and scissors are part of the command buffer, different to Vulkan
             command_buffer.set_viewports(0, iter::once(self.viewport.clone()));
             command_buffer.set_scissors(0, iter::once(self.viewport.rect));
+
+            command_buffer.bind_graphics_pipeline(&self.pipeline);
+            command_buffer
+                .bind_vertex_buffers(0, iter::once((&*self.vertex_buffer, SubRange::WHOLE)));
+            command_buffer.bind_index_buffer(&*self.index_buffer, SubRange::WHOLE, IndexType::U16);
+            command_buffer.bind_graphics_descriptor_sets(
+                &self.pipeline_layout,
+                0,
+                iter::once(&self.descriptor_sets[frame_id]),
+                iter::empty(),
+            );
 
             command_buffer.begin_render_pass(
                 &self.render_pass,
@@ -313,11 +475,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 }),
                 SubpassContents::Inline,
             );
-
-            command_buffer.bind_graphics_pipeline(&self.pipeline);
-            command_buffer
-                .bind_vertex_buffers(0, iter::once((&*self.vertex_buffer, SubRange::WHOLE)));
-            command_buffer.bind_index_buffer(&*self.index_buffer, SubRange::WHOLE, IndexType::U16);
             command_buffer.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
             command_buffer.end_render_pass();
             command_buffer.finish();
@@ -364,6 +521,33 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             .unwrap_or(default_format)
     }
 
+    fn create_buffer(
+        device: &B::Device,
+        memory_types: &[MemoryType],
+        buffer_len: u64,
+        usage: Usage,
+        properties: memory::Properties,
+    ) -> (ManuallyDrop<B::Buffer>, ManuallyDrop<B::Memory>) {
+        let mut buffer = ManuallyDrop::new(
+            unsafe { device.create_buffer(buffer_len, usage, SparseFlags::empty()) }.unwrap(),
+        );
+
+        let buffer_requirements = unsafe { device.get_buffer_requirements(&buffer) };
+
+        let buffer_memory_type =
+            Self::find_memory_type(&memory_types, buffer_requirements.type_mask, properties);
+
+        let memory = unsafe {
+            let memory = device
+                .allocate_memory(buffer_memory_type, buffer_requirements.size)
+                .unwrap();
+            device.bind_buffer_memory(&memory, 0, &mut buffer).unwrap();
+            ManuallyDrop::new(memory)
+        };
+
+        (buffer, memory)
+    }
+
     fn create_vertex_buffer(
         device: &B::Device,
         limits: &gfx_hal::Limits,
@@ -372,36 +556,22 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         let buffer_stride = size_of::<Vertex>();
         let buffer_len = VERTICES.len() * buffer_stride;
         // buffer needs to have size that's a multiple of non_coherent_atom_size for it to be mapped
-        let padded_buffer_len = (buffer_len + limits.non_coherent_atom_size - 1)
+        let padded_buffer_len = ((buffer_len + limits.non_coherent_atom_size - 1)
             / limits.non_coherent_atom_size
-            * limits.non_coherent_atom_size;
+            * limits.non_coherent_atom_size) as u64;
 
-        let mut buffer = ManuallyDrop::new(
-            unsafe {
-                device.create_buffer(
-                    padded_buffer_len as u64,
-                    Usage::VERTEX,
-                    SparseFlags::empty(),
-                )
-            }
-            .unwrap(),
-        );
-
-        let buffer_requirements = unsafe { device.get_buffer_requirements(&buffer) };
-
-        let buffer_memory_type = Self::find_memory_type(
-            &memory_types,
-            buffer_requirements.type_mask,
+        let (buffer, mut memory) = Self::create_buffer(
+            device,
+            memory_types,
+            padded_buffer_len,
+            Usage::VERTEX,
             memory::Properties::CPU_VISIBLE,
         );
 
-        // allocate memory, map it, copy data into it and unmap it
-        let memory = unsafe {
-            let mut memory = device
-                .allocate_memory(buffer_memory_type, buffer_requirements.size)
-                .unwrap();
-            device.bind_buffer_memory(&memory, 0, &mut buffer).unwrap();
+        // copy data into buffer
+        unsafe {
             let mapping = device.map_memory(&mut memory, Segment::ALL).unwrap();
+            // only copy buffer_len amounts of data!
             ptr::copy_nonoverlapping(VERTICES.as_ptr() as *const u8, mapping, buffer_len);
 
             // manually flush the memory, so that it is ensured to be available to the GPU.
@@ -410,11 +580,10 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             // either way however, the memory is not guaranteed to be visible on the GPU yet
             // until we submit our queue, according to the specification.
             device
-                .flush_mapped_memory_ranges(iter::once((&memory, Segment::ALL)))
+                .flush_mapped_memory_ranges(iter::once((&*memory, Segment::ALL)))
                 .unwrap();
 
             device.unmap_memory(&mut memory);
-            ManuallyDrop::new(memory)
         };
 
         (buffer, memory)
@@ -427,39 +596,27 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     ) -> (ManuallyDrop<B::Buffer>, ManuallyDrop<B::Memory>) {
         let buffer_stride = size_of::<u16>();
         let buffer_len = INDICES.len() * buffer_stride;
-        let padded_buffer_len = (buffer_len + limits.non_coherent_atom_size - 1)
+        let padded_buffer_len = ((buffer_len + limits.non_coherent_atom_size - 1)
             / limits.non_coherent_atom_size
-            * limits.non_coherent_atom_size;
+            * limits.non_coherent_atom_size) as u64;
 
-        let mut buffer = ManuallyDrop::new(
-            unsafe {
-                device.create_buffer(padded_buffer_len as u64, Usage::INDEX, SparseFlags::empty())
-            }
-            .unwrap(),
-        );
-
-        let buffer_requirements = unsafe { device.get_buffer_requirements(&buffer) };
-
-        let buffer_memory_type = Self::find_memory_type(
-            &memory_types,
-            buffer_requirements.type_mask,
+        let (buffer, mut memory) = Self::create_buffer(
+            device,
+            memory_types,
+            padded_buffer_len,
+            Usage::INDEX,
             memory::Properties::CPU_VISIBLE,
         );
 
-        let memory = unsafe {
-            let mut memory = device
-                .allocate_memory(buffer_memory_type, buffer_requirements.size)
-                .unwrap();
-            device.bind_buffer_memory(&memory, 0, &mut buffer).unwrap();
+        unsafe {
             let mapping = device.map_memory(&mut memory, Segment::ALL).unwrap();
             ptr::copy_nonoverlapping(INDICES.as_ptr() as *const u8, mapping, buffer_len);
 
             device
-                .flush_mapped_memory_ranges(iter::once((&memory, Segment::ALL)))
+                .flush_mapped_memory_ranges(iter::once((&*memory, Segment::ALL)))
                 .unwrap();
 
             device.unmap_memory(&mut memory);
-            ManuallyDrop::new(memory)
         };
 
         (buffer, memory)
@@ -630,10 +787,25 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                 .destroy_buffer(ManuallyDrop::take(&mut self.vertex_buffer));
             self.device
                 .destroy_buffer(ManuallyDrop::take(&mut self.index_buffer));
+            for uniform_buffer in self.uniform_buffers.iter_mut() {
+                self.device
+                    .destroy_buffer(ManuallyDrop::take(uniform_buffer));
+            }
+
             self.device
                 .free_memory(ManuallyDrop::take(&mut self.vertex_buffer_memory));
             self.device
                 .free_memory(ManuallyDrop::take(&mut self.index_buffer_memory));
+            for uniform_buffer_memory in self.uniform_buffers_memory.iter_mut() {
+                self.device
+                    .free_memory(ManuallyDrop::take(uniform_buffer_memory));
+            }
+
+            self.device
+                .destroy_descriptor_pool(ManuallyDrop::take(&mut self.descriptor_pool));
+            self.device
+                .destroy_descriptor_set_layout(ManuallyDrop::take(&mut self.descriptor_set_layout));
+
             self.device
                 .destroy_render_pass(ManuallyDrop::take(&mut self.render_pass));
             self.device
@@ -659,10 +831,10 @@ const DEFAULT_WINDOW_SIZE: [u32; 2] = [512, 512];
 
 #[cfg_attr(rustfmt, rustfmt_skip)]
 const VERTICES: [Vertex; 4] = [
-    Vertex { position: [-0.5, -0.5], color: [1.0, 1.0, 1.0] },
-    Vertex { position: [-0.5,  0.5], color: [0.0, 1.0, 1.0] },
-    Vertex { position: [ 0.5,  0.5], color: [1.0, 0.0, 1.0] },
-    Vertex { position: [ 0.5, -0.5], color: [0.0, 1.0, 1.0] },
+    Vertex { position: [-0.5, -0.5], color: [1.0, 0.0, 0.0] },
+    Vertex { position: [-0.5,  0.5], color: [0.0, 1.0, 0.0] },
+    Vertex { position: [ 0.5,  0.5], color: [0.0, 0.0, 1.0] },
+    Vertex { position: [ 0.5, -0.5], color: [1.0, 1.0, 1.0] },
 ];
 
 const INDICES: [u16; 6] = [0, 1, 2, 0, 2, 3];
