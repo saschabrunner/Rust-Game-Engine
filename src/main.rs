@@ -44,7 +44,7 @@ use winit::{
 // not dead code, we use memcpy on these structs
 #[allow(dead_code)]
 struct Vertex {
-    position: [f32; 2],
+    position: [f32; 3],
     color: [f32; 3],
 }
 
@@ -235,7 +235,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // shaders are compiled by build script
         let vertex_shader = gfx_auxil::read_spirv(Cursor::new(include_bytes!(
-            "../target/data/shaders/02_model_view_projection.vert.spv"
+            "../target/data/shaders/02_model_view_projection_3d.vert.spv"
         )))
         .unwrap();
         let fragment_shader = gfx_auxil::read_spirv(Cursor::new(include_bytes!(
@@ -397,7 +397,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // rotate model with time
         let time = self.start_time.elapsed().as_secs_f32();
-        let model = Matrix4::<f32>::from_euler_angles(0.0, 0.0, time);
+        let model = Matrix4::<f32>::from_euler_angles(0.0, -time * 90.0, time);
 
         // place camera 2 units back and 1 each below and to the right, pointing at 0,0,0
         let view = Matrix4::<f32>::look_at_rh(
@@ -712,7 +712,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                     location: 0,
                     binding: 0, // is equal to the number in the VertexBufferDesc
                     element: pso::Element {
-                        format: Format::Rg32Sfloat,
+                        format: Format::Rgb32Sfloat,
                         offset: 0,
                     },
                 },
@@ -830,14 +830,27 @@ const APPLICATION_NAME: &'static str = "Rust Game Engine";
 const DEFAULT_WINDOW_SIZE: [u32; 2] = [512, 512];
 
 #[cfg_attr(rustfmt, rustfmt_skip)]
-const VERTICES: [Vertex; 4] = [
-    Vertex { position: [-0.5, -0.5], color: [1.0, 0.0, 0.0] },
-    Vertex { position: [-0.5,  0.5], color: [0.0, 1.0, 0.0] },
-    Vertex { position: [ 0.5,  0.5], color: [0.0, 0.0, 1.0] },
-    Vertex { position: [ 0.5, -0.5], color: [1.0, 1.0, 1.0] },
+const VERTICES: [Vertex; 8] = [
+    Vertex { position: [-0.5, -0.5,  0.5], color: [1.0, 0.0, 0.0] },
+    Vertex { position: [-0.5,  0.5,  0.5], color: [0.0, 1.0, 0.0] },
+    Vertex { position: [ 0.5,  0.5,  0.5], color: [0.0, 0.0, 1.0] },
+    Vertex { position: [ 0.5, -0.5,  0.5], color: [1.0, 1.0, 1.0] },
+
+    Vertex { position: [-0.5, -0.5, -0.5], color: [1.0, 0.0, 0.0] },
+    Vertex { position: [-0.5,  0.5, -0.5], color: [0.0, 1.0, 0.0] },
+    Vertex { position: [ 0.5,  0.5, -0.5], color: [0.0, 0.0, 1.0] },
+    Vertex { position: [ 0.5, -0.5, -0.5], color: [1.0, 1.0, 1.0] },
 ];
 
-const INDICES: [u16; 6] = [0, 1, 2, 0, 2, 3];
+#[cfg_attr(rustfmt, rustfmt_skip)]
+const INDICES: [u16; 36] = [
+    0, 1, 2, 0, 2, 3,   // front
+    7, 6, 5, 7, 5, 4,   // back
+    4, 5, 1, 4, 1, 0,   // left
+    3, 2, 6, 3, 6, 7,   // right
+    4, 0, 3, 4, 3, 7,   // top
+    1, 5, 6, 1, 6, 2,   // bottom
+];
 
 fn main() {
     let event_loop = winit::event_loop::EventLoop::new();
