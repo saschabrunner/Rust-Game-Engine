@@ -146,85 +146,18 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         let surface_format = Self::find_surface_format(physical_device, &surface);
         let render_pass = Self::create_render_pass(&device, surface_format);
 
-        let descriptor_set_layout = ManuallyDrop::new(
-            unsafe {
-                device.create_descriptor_set_layout(
-                    iter::once(DescriptorSetLayoutBinding {
-                        binding: 0,
-                        ty: DescriptorType::Buffer {
-                            ty: BufferDescriptorType::Uniform,
-                            format: BufferDescriptorFormat::Structured {
-                                dynamic_offset: false,
-                            },
-                        },
-                        count: 1,
-                        stage_flags: ShaderStageFlags::VERTEX,
-                        immutable_samplers: false,
-                    }),
-                    iter::empty(),
-                )
-            }
-            .expect("Out of memory creating descriptor set layout"),
+        // create descriptors for uniforms
+        let descriptor_set_layout = Self::create_descriptor_set_layout(&device);
+        let (uniform_buffers, uniform_buffers_memory) =
+            Self::create_uniform_buffers(&device, &limits, &memory_types, frames_in_flight);
+        let mut descriptor_pool = Self::create_descriptor_pool(&device, frames_in_flight);
+        let descriptor_sets = Self::create_descriptor_sets(
+            &device,
+            &descriptor_set_layout,
+            &mut descriptor_pool,
+            &uniform_buffers,
+            frames_in_flight,
         );
-
-        let mut uniform_buffers = Vec::with_capacity(frames_in_flight);
-        let mut uniform_buffers_memory = Vec::with_capacity(frames_in_flight);
-        let padded_length = ((size_of::<Transformations>() + limits.non_coherent_atom_size - 1)
-            / limits.non_coherent_atom_size
-            * limits.non_coherent_atom_size) as u64;
-        for _ in 0..frames_in_flight {
-            let (uniform_buffer, uniform_buffer_memory) = Self::create_buffer(
-                &device,
-                &memory_types,
-                padded_length,
-                Usage::UNIFORM,
-                memory::Properties::CPU_VISIBLE,
-            );
-            uniform_buffers.push(uniform_buffer);
-            uniform_buffers_memory.push(uniform_buffer_memory);
-        }
-
-        let mut descriptor_pool = ManuallyDrop::new(
-            unsafe {
-                device.create_descriptor_pool(
-                    frames_in_flight,
-                    iter::once(DescriptorRangeDesc {
-                        ty: DescriptorType::Buffer {
-                            // TODO: Don't duplicate that
-                            ty: BufferDescriptorType::Uniform,
-                            format: BufferDescriptorFormat::Structured {
-                                dynamic_offset: false,
-                            },
-                        },
-                        count: frames_in_flight,
-                    }),
-                    DescriptorPoolCreateFlags::empty(),
-                )
-            }
-            .expect("Out of memory creating descriptor pool"),
-        );
-
-        let mut descriptor_sets = Vec::with_capacity(frames_in_flight);
-        let mut cloned_layouts = Vec::with_capacity(frames_in_flight);
-        for _ in 0..frames_in_flight {
-            cloned_layouts.push(&*descriptor_set_layout);
-        }
-        unsafe { descriptor_pool.allocate(cloned_layouts.into_iter(), &mut descriptor_sets) }
-            .unwrap();
-
-        for i in 0..frames_in_flight {
-            unsafe {
-                device.write_descriptor_set(DescriptorSetWrite {
-                    set: &mut descriptor_sets[i],
-                    binding: 0,
-                    array_offset: 0,
-                    descriptors: iter::once(Descriptor::Buffer(
-                        &*uniform_buffers[i],
-                        SubRange::WHOLE,
-                    )),
-                })
-            }
-        }
 
         // used for uniforms and push constants in the future
         let pipeline_layout = ManuallyDrop::new(unsafe {
@@ -620,6 +553,111 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         };
 
         (buffer, memory)
+    }
+
+    fn create_descriptor_set_layout(device: &B::Device) -> ManuallyDrop<B::DescriptorSetLayout> {
+        ManuallyDrop::new(
+            unsafe {
+                device.create_descriptor_set_layout(
+                    iter::once(DescriptorSetLayoutBinding {
+                        binding: 0,
+                        ty: DescriptorType::Buffer {
+                            ty: BufferDescriptorType::Uniform,
+                            format: BufferDescriptorFormat::Structured {
+                                dynamic_offset: false,
+                            },
+                        },
+                        count: 1,
+                        stage_flags: ShaderStageFlags::VERTEX,
+                        immutable_samplers: false,
+                    }),
+                    iter::empty(),
+                )
+            }
+            .expect("Out of memory creating descriptor set layout"),
+        )
+    }
+
+    fn create_uniform_buffers(
+        device: &B::Device,
+        limits: &gfx_hal::Limits,
+        memory_types: &[MemoryType],
+        frames_in_flight: usize,
+    ) -> (Vec<ManuallyDrop<B::Buffer>>, Vec<ManuallyDrop<B::Memory>>) {
+        let mut uniform_buffers = Vec::with_capacity(frames_in_flight);
+        let mut uniform_buffers_memory = Vec::with_capacity(frames_in_flight);
+        let padded_length = ((size_of::<Transformations>() + limits.non_coherent_atom_size - 1)
+            / limits.non_coherent_atom_size
+            * limits.non_coherent_atom_size) as u64;
+        for _ in 0..frames_in_flight {
+            let (uniform_buffer, uniform_buffer_memory) = Self::create_buffer(
+                &device,
+                &memory_types,
+                padded_length,
+                Usage::UNIFORM,
+                memory::Properties::CPU_VISIBLE,
+            );
+            uniform_buffers.push(uniform_buffer);
+            uniform_buffers_memory.push(uniform_buffer_memory);
+        }
+
+        (uniform_buffers, uniform_buffers_memory)
+    }
+
+    fn create_descriptor_pool(
+        device: &B::Device,
+        frames_in_flight: usize,
+    ) -> ManuallyDrop<B::DescriptorPool> {
+        ManuallyDrop::new(
+            unsafe {
+                device.create_descriptor_pool(
+                    frames_in_flight,
+                    iter::once(DescriptorRangeDesc {
+                        ty: DescriptorType::Buffer {
+                            ty: BufferDescriptorType::Uniform,
+                            format: BufferDescriptorFormat::Structured {
+                                dynamic_offset: false,
+                            },
+                        },
+                        count: frames_in_flight,
+                    }),
+                    DescriptorPoolCreateFlags::empty(),
+                )
+            }
+            .expect("Out of memory creating descriptor pool"),
+        )
+    }
+
+    fn create_descriptor_sets(
+        device: &B::Device,
+        descriptor_set_layout: &B::DescriptorSetLayout,
+        descriptor_pool: &mut B::DescriptorPool,
+        uniform_buffers: &Vec<ManuallyDrop<B::Buffer>>,
+        frames_in_flight: usize,
+    ) -> Vec<B::DescriptorSet> {
+        let mut descriptor_sets = Vec::with_capacity(frames_in_flight);
+        let mut cloned_layouts = Vec::with_capacity(frames_in_flight);
+        for _ in 0..frames_in_flight {
+            cloned_layouts.push(&*descriptor_set_layout);
+        }
+        unsafe { descriptor_pool.allocate(cloned_layouts.into_iter(), &mut descriptor_sets) }
+            .unwrap();
+
+        for i in 0..frames_in_flight {
+            unsafe {
+                device.write_descriptor_set(DescriptorSetWrite {
+                    set: &mut descriptor_sets[i],
+                    binding: 0,
+                    array_offset: 0,
+                    descriptors: iter::once(Descriptor::Buffer(
+                        &*uniform_buffers[i],
+                        SubRange::WHOLE,
+                    )),
+                })
+            }
+        }
+
+        descriptor_sets
     }
 
     fn find_memory_type(
