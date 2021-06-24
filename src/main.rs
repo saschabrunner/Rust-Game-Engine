@@ -11,8 +11,8 @@ use gfx_hal::{
     adapter::{Adapter, MemoryType, PhysicalDevice},
     buffer::{SubRange, Usage},
     command::{
-        ClearColor, ClearValue, CommandBuffer, CommandBufferFlags, Level, RenderAttachmentInfo,
-        SubpassContents,
+        BufferCopy, ClearColor, ClearValue, CommandBuffer, CommandBufferFlags, Level,
+        RenderAttachmentInfo, SubpassContents,
     },
     device::Device,
     format::{ChannelType, Format},
@@ -105,13 +105,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         };
 
         let device = gpu.device;
-        let queue_group = gpu.queue_groups.pop().unwrap();
-
-        let (vertex_buffer, vertex_buffer_memory) =
-            Self::create_vertex_buffer(&device, &limits, &memory_types);
-
-        let (index_buffer, index_buffer_memory) =
-            Self::create_index_buffer(&device, &limits, &memory_types);
+        let mut queue_group = gpu.queue_groups.pop().unwrap();
 
         // limit amount of frames calculated simultaneously to avoid the CPU outrunning the GPU
         let frames_in_flight = 3;
@@ -145,6 +139,22 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         let surface_format = Self::find_surface_format(physical_device, &surface);
         let render_pass = Self::create_render_pass(&device, surface_format);
+
+        let (vertex_buffer, vertex_buffer_memory) = Self::create_vertex_buffer(
+            &device,
+            &mut queue_group,
+            &mut command_pools[0],
+            &limits,
+            &memory_types,
+        );
+
+        let (index_buffer, index_buffer_memory) = Self::create_index_buffer(
+            &device,
+            &mut queue_group,
+            &mut command_pools[0],
+            &limits,
+            &memory_types,
+        );
 
         // create descriptors for uniforms
         let descriptor_set_layout = Self::create_descriptor_set_layout(&device);
@@ -354,25 +364,12 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // copy data into uniform buffer
         unsafe {
-            let mapping = self
-                .device
-                .map_memory(&mut self.uniform_buffers_memory[frame_id], Segment::ALL)
-                .unwrap();
-            ptr::copy_nonoverlapping(
+            Self::copy_into_memory(
+                &self.device,
                 &transformations as *const Transformations as *const u8,
-                mapping,
+                &mut self.uniform_buffers_memory[frame_id],
                 size_of::<Transformations>(),
-            );
-
-            self.device
-                .flush_mapped_memory_ranges(iter::once((
-                    &*self.uniform_buffers_memory[frame_id],
-                    Segment::ALL,
-                )))
-                .unwrap();
-
-            self.device
-                .unmap_memory(&mut self.uniform_buffers_memory[frame_id]);
+            )
         };
 
         let command_buffer = &mut self.command_buffers[frame_id];
@@ -481,8 +478,71 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         (buffer, memory)
     }
 
+    /// Copies into a CPU visible buffer, undefined behavior if memory is not CPU visible!
+    unsafe fn copy_into_memory(
+        device: &B::Device,
+        source: *const u8,
+        destination: &mut B::Memory,
+        len: usize,
+    ) {
+        let mapping = device.map_memory(destination, Segment::ALL).unwrap();
+        ptr::copy_nonoverlapping(source, mapping, len);
+
+        // manually flush the memory, so that it is ensured to be available to the GPU.
+        // if instead limited buffer_memory_type to a type that contains the property
+        // memory::Properties::COHERENT, we wouldn't have to explicitly flush, possible
+        // optimization for the future.
+        // either way however, the memory is not guaranteed to be visible on the GPU yet
+        // until we submit our queue, according to the specification.
+        device
+            .flush_mapped_memory_ranges(iter::once((&*destination, Segment::ALL)))
+            .unwrap();
+
+        device.unmap_memory(destination);
+    }
+
+    fn copy_buffer(
+        device: &B::Device,
+        queue_group: &mut QueueGroup<B>,
+        source: &B::Buffer,
+        destination: &B::Buffer,
+        command_pool: &mut B::CommandPool,
+        len: u64,
+    ) {
+        let mut copy_fence = device
+            .create_fence(false)
+            .expect("Out of memory creating fence");
+
+        unsafe {
+            let mut command_buffer = command_pool.allocate_one(Level::Primary);
+            command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
+            command_buffer.copy_buffer(
+                &*source,
+                &*destination,
+                iter::once(BufferCopy {
+                    src: 0,
+                    dst: 0,
+                    size: len as u64,
+                }),
+            );
+            command_buffer.finish();
+            queue_group.queues[0].submit(
+                iter::once(&command_buffer),
+                iter::empty(),
+                iter::empty(),
+                Some(&mut copy_fence),
+            );
+
+            device.wait_for_fence(&copy_fence, !0).unwrap();
+            command_pool.free(iter::once(command_buffer));
+            device.destroy_fence(copy_fence);
+        }
+    }
+
     fn create_vertex_buffer(
         device: &B::Device,
+        queue_group: &mut QueueGroup<B>,
+        command_pool: &mut B::CommandPool,
         limits: &gfx_hal::Limits,
         memory_types: &[MemoryType],
     ) -> (ManuallyDrop<B::Buffer>, ManuallyDrop<B::Memory>) {
@@ -493,37 +553,54 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             / limits.non_coherent_atom_size
             * limits.non_coherent_atom_size) as u64;
 
-        let (buffer, mut memory) = Self::create_buffer(
+        let (staging_buffer, mut staging_memory) = Self::create_buffer(
             device,
             memory_types,
             padded_buffer_len,
-            Usage::VERTEX,
+            Usage::TRANSFER_SRC,
             memory::Properties::CPU_VISIBLE,
         );
 
-        // copy data into buffer
+        // copy data into staging buffer
         unsafe {
-            let mapping = device.map_memory(&mut memory, Segment::ALL).unwrap();
-            // only copy buffer_len amounts of data!
-            ptr::copy_nonoverlapping(VERTICES.as_ptr() as *const u8, mapping, buffer_len);
-
-            // manually flush the memory, so that it is ensured to be available to the GPU.
-            // if instead limited buffer_memory_type to a type that contains the property
-            // memory::Properties::COHERENT, we wouldn't have to explicitly flush.
-            // either way however, the memory is not guaranteed to be visible on the GPU yet
-            // until we submit our queue, according to the specification.
-            device
-                .flush_mapped_memory_ranges(iter::once((&*memory, Segment::ALL)))
-                .unwrap();
-
-            device.unmap_memory(&mut memory);
+            Self::copy_into_memory(
+                device,
+                VERTICES.as_ptr() as *const u8,
+                &mut staging_memory,
+                buffer_len,
+            )
         };
+
+        let (buffer, memory) = Self::create_buffer(
+            device,
+            memory_types,
+            buffer_len as u64,
+            Usage::TRANSFER_DST | Usage::VERTEX,
+            memory::Properties::DEVICE_LOCAL,
+        );
+
+        // copy staging buffer into final buffer
+        Self::copy_buffer(
+            device,
+            queue_group,
+            &staging_buffer,
+            &buffer,
+            command_pool,
+            buffer_len as u64,
+        );
+
+        unsafe {
+            device.destroy_buffer(ManuallyDrop::into_inner(staging_buffer));
+            device.free_memory(ManuallyDrop::into_inner(staging_memory));
+        }
 
         (buffer, memory)
     }
 
     fn create_index_buffer(
         device: &B::Device,
+        queue_group: &mut QueueGroup<B>,
+        command_pool: &mut B::CommandPool,
         limits: &gfx_hal::Limits,
         memory_types: &[MemoryType],
     ) -> (ManuallyDrop<B::Buffer>, ManuallyDrop<B::Memory>) {
@@ -533,24 +610,44 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             / limits.non_coherent_atom_size
             * limits.non_coherent_atom_size) as u64;
 
-        let (buffer, mut memory) = Self::create_buffer(
+        let (staging_buffer, mut staging_memory) = Self::create_buffer(
             device,
             memory_types,
             padded_buffer_len,
-            Usage::INDEX,
+            Usage::TRANSFER_SRC,
             memory::Properties::CPU_VISIBLE,
         );
 
         unsafe {
-            let mapping = device.map_memory(&mut memory, Segment::ALL).unwrap();
-            ptr::copy_nonoverlapping(INDICES.as_ptr() as *const u8, mapping, buffer_len);
-
-            device
-                .flush_mapped_memory_ranges(iter::once((&*memory, Segment::ALL)))
-                .unwrap();
-
-            device.unmap_memory(&mut memory);
+            Self::copy_into_memory(
+                device,
+                INDICES.as_ptr() as *const u8,
+                &mut staging_memory,
+                buffer_len,
+            )
         };
+
+        let (buffer, memory) = Self::create_buffer(
+            device,
+            memory_types,
+            buffer_len as u64,
+            Usage::TRANSFER_DST | Usage::INDEX,
+            memory::Properties::DEVICE_LOCAL,
+        );
+
+        Self::copy_buffer(
+            device,
+            queue_group,
+            &staging_buffer,
+            &buffer,
+            command_pool,
+            buffer_len as u64,
+        );
+
+        unsafe {
+            device.destroy_buffer(ManuallyDrop::into_inner(staging_buffer));
+            device.free_memory(ManuallyDrop::into_inner(staging_memory));
+        }
 
         (buffer, memory)
     }
