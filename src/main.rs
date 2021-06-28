@@ -3,20 +3,23 @@ use std::{
     io::Cursor,
     iter,
     mem::{size_of, ManuallyDrop},
+    ops::Range,
     ptr,
     time::Instant,
 };
 
 use gfx_hal::{
     adapter::{Adapter, MemoryType, PhysicalDevice},
-    buffer::{SubRange, Usage},
+    buffer::{self, SubRange},
     command::{
-        BufferCopy, ClearColor, ClearValue, CommandBuffer, CommandBufferFlags, Level,
-        RenderAttachmentInfo, SubpassContents,
+        BufferCopy, BufferImageCopy, ClearColor, ClearValue, CommandBuffer, CommandBufferFlags,
+        Level, RenderAttachmentInfo, SubpassContents,
     },
     device::Device,
-    format::{ChannelType, Format},
-    image::{Extent, Layout},
+    format::{Aspects, ChannelType, Format},
+    image::{
+        self as gfximg, Extent, Layout, SubresourceLayers, SubresourceRange, ViewCapabilities,
+    },
     memory::{self, Segment, SparseFlags},
     pass::{Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, Subpass, SubpassDesc},
     pool::{CommandPool, CommandPoolCreateFlags},
@@ -24,7 +27,7 @@ use gfx_hal::{
         self, AttributeDesc, BlendState, BufferDescriptorFormat, BufferDescriptorType,
         ColorBlendDesc, ColorMask, Descriptor, DescriptorPool, DescriptorPoolCreateFlags,
         DescriptorRangeDesc, DescriptorSetLayoutBinding, DescriptorSetWrite, DescriptorType,
-        EntryPoint, Face, GraphicsPipelineDesc, InputAssemblerDesc, Primitive,
+        EntryPoint, Face, GraphicsPipelineDesc, InputAssemblerDesc, PipelineStage, Primitive,
         PrimitiveAssemblerDesc, Rasterizer, Rect, ShaderStageFlags, Specialization,
         VertexBufferDesc, VertexInputRate, Viewport,
     },
@@ -72,9 +75,11 @@ struct Renderer<B: gfx_hal::Backend> {
     vertex_buffer: ManuallyDrop<B::Buffer>,
     index_buffer: ManuallyDrop<B::Buffer>,
     uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
+    texture_image: ManuallyDrop<B::Image>,
     vertex_buffer_memory: ManuallyDrop<B::Memory>,
     index_buffer_memory: ManuallyDrop<B::Memory>,
     uniform_buffers_memory: Vec<ManuallyDrop<B::Memory>>,
+    texture_memory: ManuallyDrop<B::Memory>,
     descriptor_set_layout: ManuallyDrop<B::DescriptorSetLayout>,
     descriptor_pool: ManuallyDrop<B::DescriptorPool>,
     descriptor_sets: Vec<B::DescriptorSet>,
@@ -169,6 +174,21 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             frames_in_flight,
         );
 
+        let image = image::load(
+            Cursor::new(include_bytes!("../data/textures/ears.png")),
+            image::ImageFormat::Png,
+        )
+        .unwrap()
+        .to_rgba8();
+        let (texture_image, texture_memory) = Self::create_texture_image(
+            &device,
+            &mut queue_group,
+            &mut command_pools[0],
+            &limits,
+            &memory_types,
+            image,
+        );
+
         // used for uniforms and push constants in the future
         let pipeline_layout = ManuallyDrop::new(unsafe {
             device
@@ -200,7 +220,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             width: DEFAULT_WINDOW_SIZE[0],
             height: DEFAULT_WINDOW_SIZE[1],
         };
-        let capabilities = surface.capabilities(&adapter.physical_device);
+        let capabilities = surface.capabilities(physical_device);
         let swapchain_config =
             SwapchainConfig::from_caps(&capabilities, surface_format, default_surface_extent);
 
@@ -260,9 +280,11 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             vertex_buffer,
             index_buffer,
             uniform_buffers,
+            texture_image,
             vertex_buffer_memory,
             index_buffer_memory,
             uniform_buffers_memory,
+            texture_memory,
             descriptor_set_layout,
             descriptor_pool,
             descriptor_sets,
@@ -455,7 +477,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         device: &B::Device,
         memory_types: &[MemoryType],
         buffer_len: u64,
-        usage: Usage,
+        usage: buffer::Usage,
         properties: memory::Properties,
     ) -> (ManuallyDrop<B::Buffer>, ManuallyDrop<B::Memory>) {
         let mut buffer = ManuallyDrop::new(
@@ -476,6 +498,167 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         };
 
         (buffer, memory)
+    }
+
+    fn create_image(
+        device: &B::Device,
+        memory_types: &[MemoryType],
+        width: u32,
+        height: u32,
+        format: Format,
+        tiling: gfximg::Tiling,
+        usage: gfximg::Usage,
+        properties: memory::Properties,
+    ) -> (ManuallyDrop<B::Image>, ManuallyDrop<B::Memory>) {
+        let mut image = ManuallyDrop::new(
+            unsafe {
+                device.create_image(
+                    gfximg::Kind::D2(width, height, 1, 1),
+                    1,
+                    format,
+                    tiling,
+                    usage,
+                    SparseFlags::empty(),
+                    ViewCapabilities::empty(),
+                )
+            }
+            .unwrap(),
+        );
+
+        let image_requirements = unsafe { device.get_image_requirements(&image) };
+        let memory_type =
+            Self::find_memory_type(&memory_types, image_requirements.type_mask, properties);
+        let memory = unsafe {
+            let memory = device
+                .allocate_memory(memory_type, image_requirements.size)
+                .unwrap();
+            device.bind_image_memory(&memory, 0, &mut image).unwrap();
+            ManuallyDrop::new(memory)
+        };
+
+        (image, memory)
+    }
+
+    fn transition_image_layout(
+        device: &B::Device,
+        queue_group: &mut QueueGroup<B>,
+        command_pool: &mut B::CommandPool,
+        image: &B::Image,
+        layouts: Range<Layout>,
+    ) {
+        let mut command_fence = device
+            .create_fence(false)
+            .expect("Out of memory creating fence");
+
+        let (stages, accesses) =
+            if layouts.start == Layout::Undefined && layouts.end == Layout::TransferDstOptimal {
+                Some((
+                    PipelineStage::TOP_OF_PIPE..PipelineStage::TRANSFER,
+                    gfximg::Access::empty()..gfximg::Access::TRANSFER_WRITE,
+                ))
+            } else if layouts.start == Layout::TransferDstOptimal
+                && layouts.end == Layout::ShaderReadOnlyOptimal
+            {
+                Some((
+                    PipelineStage::TRANSFER..PipelineStage::FRAGMENT_SHADER,
+                    gfximg::Access::TRANSFER_WRITE..gfximg::Access::SHADER_READ,
+                ))
+            } else {
+                None
+            }
+            .expect(&format!(
+                "Unsupported combination of layouts {:?} and {:?}",
+                layouts.start, layouts.end
+            ));
+
+        unsafe {
+            let mut command_buffer = command_pool.allocate_one(Level::Primary);
+            command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
+            command_buffer.pipeline_barrier(
+                // our transition can happen in between any of these stages,
+                // optimally we would want this gap to be as wide as possible
+                stages.start..stages.end,
+                memory::Dependencies::empty(),
+                iter::once(memory::Barrier::Image {
+                    // our data starts with those access flags and this layout
+                    // and transitions to the latter ones in the range
+                    states: (accesses.start, layouts.start)..(accesses.end, layouts.end),
+                    target: image,
+                    range: SubresourceRange {
+                        aspects: Aspects::COLOR,
+                        level_start: 0,
+                        level_count: None,
+                        layer_start: 0,
+                        layer_count: None,
+                    },
+                    families: None, // used only for ownership transfer
+                }),
+            );
+
+            command_buffer.finish();
+            queue_group.queues[0].submit(
+                iter::once(&command_buffer),
+                iter::empty(),
+                iter::empty(),
+                Some(&mut command_fence),
+            );
+
+            device.wait_for_fence(&command_fence, !0).unwrap();
+            command_pool.free(iter::once(command_buffer));
+            device.destroy_fence(command_fence);
+        }
+    }
+
+    fn copy_buffer_to_image(
+        device: &B::Device,
+        queue_group: &mut QueueGroup<B>,
+        source: &B::Buffer,
+        destination: &B::Image,
+        command_pool: &mut B::CommandPool,
+        width: u32,
+        height: u32,
+    ) {
+        let mut copy_fence = device
+            .create_fence(false)
+            .expect("Out of memory creating fence");
+
+        unsafe {
+            let mut command_buffer = command_pool.allocate_one(Level::Primary);
+            command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
+
+            command_buffer.copy_buffer_to_image(
+                &source,
+                &destination,
+                Layout::TransferDstOptimal,
+                iter::once(BufferImageCopy {
+                    buffer_offset: 0,
+                    buffer_width: width,
+                    buffer_height: height,
+                    image_layers: SubresourceLayers {
+                        aspects: Aspects::COLOR,
+                        level: 0,
+                        layers: 0..1,
+                    },
+                    image_offset: gfximg::Offset::ZERO,
+                    image_extent: Extent {
+                        width: width,
+                        height: height,
+                        depth: 1,
+                    },
+                }),
+            );
+            command_buffer.finish();
+            queue_group.queues[0].submit(
+                iter::once(&command_buffer),
+                iter::empty(),
+                iter::empty(),
+                Some(&mut copy_fence),
+            );
+
+            device.wait_for_fence(&copy_fence, !0).unwrap();
+            command_pool.free(iter::once(command_buffer));
+            device.destroy_fence(copy_fence);
+        }
     }
 
     /// Copies into a CPU visible buffer, undefined behavior if memory is not CPU visible!
@@ -557,7 +740,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             device,
             memory_types,
             padded_buffer_len,
-            Usage::TRANSFER_SRC,
+            buffer::Usage::TRANSFER_SRC,
             memory::Properties::CPU_VISIBLE,
         );
 
@@ -575,7 +758,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             device,
             memory_types,
             buffer_len as u64,
-            Usage::TRANSFER_DST | Usage::VERTEX,
+            buffer::Usage::TRANSFER_DST | buffer::Usage::VERTEX,
             memory::Properties::DEVICE_LOCAL,
         );
 
@@ -614,7 +797,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             device,
             memory_types,
             padded_buffer_len,
-            Usage::TRANSFER_SRC,
+            buffer::Usage::TRANSFER_SRC,
             memory::Properties::CPU_VISIBLE,
         );
 
@@ -631,7 +814,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             device,
             memory_types,
             buffer_len as u64,
-            Usage::TRANSFER_DST | Usage::INDEX,
+            buffer::Usage::TRANSFER_DST | buffer::Usage::INDEX,
             memory::Properties::DEVICE_LOCAL,
         );
 
@@ -691,7 +874,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 &device,
                 &memory_types,
                 padded_length,
-                Usage::UNIFORM,
+                buffer::Usage::UNIFORM,
                 memory::Properties::CPU_VISIBLE,
             );
             uniform_buffers.push(uniform_buffer);
@@ -755,6 +938,84 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         }
 
         descriptor_sets
+    }
+
+    fn create_texture_image(
+        device: &B::Device,
+        queue_group: &mut QueueGroup<B>,
+        command_pool: &mut B::CommandPool,
+        limits: &gfx_hal::Limits,
+        memory_types: &[MemoryType],
+        raw_image: image::RgbaImage,
+    ) -> (ManuallyDrop<B::Image>, ManuallyDrop<B::Memory>) {
+        let buffer_len = raw_image.width() * raw_image.height() * 4;
+        let padded_buffer_len = ((buffer_len as usize + limits.non_coherent_atom_size - 1)
+            / limits.non_coherent_atom_size
+            * limits.non_coherent_atom_size) as u64;
+
+        let (staging_buffer, mut staging_memory) = Self::create_buffer(
+            &device,
+            &memory_types,
+            padded_buffer_len,
+            buffer::Usage::TRANSFER_SRC,
+            memory::Properties::CPU_VISIBLE,
+        );
+
+        unsafe {
+            Self::copy_into_memory(
+                &device,
+                raw_image.as_ptr(),
+                &mut staging_memory,
+                buffer_len as usize,
+            )
+        };
+
+        let (texture_image, texture_memory) = Self::create_image(
+            &device,
+            &memory_types,
+            raw_image.width(),
+            raw_image.height(),
+            Format::Rgba8Srgb,
+            gfximg::Tiling::Optimal,
+            gfximg::Usage::TRANSFER_DST | gfximg::Usage::SAMPLED,
+            memory::Properties::DEVICE_LOCAL,
+        );
+
+        // transition to transfer destination layout
+        Self::transition_image_layout(
+            &device,
+            queue_group,
+            command_pool,
+            &texture_image,
+            Layout::Undefined..Layout::TransferDstOptimal,
+        );
+
+        // copy buffer to image
+        Self::copy_buffer_to_image(
+            &device,
+            queue_group,
+            &staging_buffer,
+            &texture_image,
+            command_pool,
+            raw_image.width(),
+            raw_image.height(),
+        );
+
+        // transition image to shader read layout
+        Self::transition_image_layout(
+            &device,
+            queue_group,
+            command_pool,
+            &texture_image,
+            Layout::TransferDstOptimal..Layout::ShaderReadOnlyOptimal,
+        );
+
+        unsafe {
+            device.destroy_buffer(ManuallyDrop::into_inner(staging_buffer));
+            device.free_memory(ManuallyDrop::into_inner(staging_memory));
+        }
+
+        (texture_image, texture_memory)
     }
 
     fn find_memory_type(
@@ -926,6 +1187,8 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                 self.device
                     .destroy_buffer(ManuallyDrop::take(uniform_buffer));
             }
+            self.device
+                .destroy_image(ManuallyDrop::take(&mut self.texture_image));
 
             self.device
                 .free_memory(ManuallyDrop::take(&mut self.vertex_buffer_memory));
@@ -935,6 +1198,8 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                 self.device
                     .free_memory(ManuallyDrop::take(uniform_buffer_memory));
             }
+            self.device
+                .free_memory(ManuallyDrop::take(&mut self.texture_memory));
 
             self.device
                 .destroy_descriptor_pool(ManuallyDrop::take(&mut self.descriptor_pool));
