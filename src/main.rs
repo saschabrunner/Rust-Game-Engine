@@ -16,9 +16,10 @@ use gfx_hal::{
         Level, RenderAttachmentInfo, SubpassContents,
     },
     device::Device,
-    format::{Aspects, ChannelType, Format},
+    format::{Aspects, ChannelType, Format, Swizzle},
     image::{
-        self as gfximg, Extent, Layout, SubresourceLayers, SubresourceRange, ViewCapabilities,
+        self as gfximg, Extent, Layout, SamplerDesc, SubresourceLayers, SubresourceRange,
+        ViewCapabilities, ViewKind,
     },
     memory::{self, Segment, SparseFlags},
     pass::{Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, Subpass, SubpassDesc},
@@ -72,6 +73,8 @@ struct Renderer<B: gfx_hal::Backend> {
     submission_complete_fences: Vec<B::Fence>,
     command_pools: Vec<B::CommandPool>,
     command_buffers: Vec<B::CommandBuffer>,
+    texture_image_view: ManuallyDrop<B::ImageView>,
+    texture_sampler: ManuallyDrop<B::Sampler>,
     vertex_buffer: ManuallyDrop<B::Buffer>,
     index_buffer: ManuallyDrop<B::Buffer>,
     uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
@@ -186,8 +189,11 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             &mut command_pools[0],
             &limits,
             &memory_types,
-            image,
+            &image,
         );
+
+        let texture_image_view = Self::create_texture_image_view(&device, &texture_image);
+        let texture_sampler = Self::create_texture_sampler(&device);
 
         // used for uniforms and push constants in the future
         let pipeline_layout = ManuallyDrop::new(unsafe {
@@ -277,6 +283,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             submission_complete_fences,
             command_pools,
             command_buffers,
+            texture_image_view,
+            texture_sampler,
             vertex_buffer,
             index_buffer,
             uniform_buffers,
@@ -946,7 +954,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         command_pool: &mut B::CommandPool,
         limits: &gfx_hal::Limits,
         memory_types: &[MemoryType],
-        raw_image: image::RgbaImage,
+        raw_image: &image::RgbaImage,
     ) -> (ManuallyDrop<B::Image>, ManuallyDrop<B::Memory>) {
         let buffer_len = raw_image.width() * raw_image.height() * 4;
         let padded_buffer_len = ((buffer_len as usize + limits.non_coherent_atom_size - 1)
@@ -1016,6 +1024,44 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         }
 
         (texture_image, texture_memory)
+    }
+
+    fn create_texture_image_view(
+        device: &B::Device,
+        image: &B::Image,
+    ) -> ManuallyDrop<B::ImageView> {
+        ManuallyDrop::new(
+            unsafe {
+                device.create_image_view(
+                    image,
+                    ViewKind::D2,
+                    Format::Rgba8Srgb,
+                    Swizzle::NO,
+                    gfximg::Usage::SAMPLED,
+                    SubresourceRange {
+                        aspects: Aspects::COLOR,
+                        level_start: 0,
+                        level_count: None,
+                        layer_start: 0,
+                        layer_count: None,
+                    },
+                )
+            }
+            .unwrap(),
+        )
+    }
+
+    fn create_texture_sampler(device: &B::Device) -> ManuallyDrop<B::Sampler> {
+        // this uses no anisotropy, has to be changed if required
+        ManuallyDrop::new(
+            unsafe {
+                device.create_sampler(&SamplerDesc::new(
+                    gfximg::Filter::Linear,
+                    gfximg::WrapMode::Clamp,
+                ))
+            }
+            .unwrap(),
+        )
     }
 
     fn find_memory_type(
@@ -1178,6 +1224,11 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
             for submission_complete_fence in self.submission_complete_fences.drain(..) {
                 self.device.destroy_fence(submission_complete_fence);
             }
+
+            self.device
+                .destroy_image_view(ManuallyDrop::take(&mut self.texture_image_view));
+            self.device
+                .destroy_sampler(ManuallyDrop::take(&mut self.texture_sampler));
 
             self.device
                 .destroy_buffer(ManuallyDrop::take(&mut self.vertex_buffer));
