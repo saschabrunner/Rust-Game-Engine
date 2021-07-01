@@ -28,9 +28,9 @@ use gfx_hal::{
         self, AttributeDesc, BlendState, BufferDescriptorFormat, BufferDescriptorType,
         ColorBlendDesc, ColorMask, Descriptor, DescriptorPool, DescriptorPoolCreateFlags,
         DescriptorRangeDesc, DescriptorSetLayoutBinding, DescriptorSetWrite, DescriptorType,
-        EntryPoint, Face, GraphicsPipelineDesc, InputAssemblerDesc, PipelineStage, Primitive,
-        PrimitiveAssemblerDesc, Rasterizer, Rect, ShaderStageFlags, Specialization,
-        VertexBufferDesc, VertexInputRate, Viewport,
+        EntryPoint, Face, GraphicsPipelineDesc, ImageDescriptorType, InputAssemblerDesc,
+        PipelineStage, Primitive, PrimitiveAssemblerDesc, Rasterizer, Rect, ShaderStageFlags,
+        Specialization, VertexBufferDesc, VertexInputRate, Viewport,
     },
     queue::{Queue, QueueFamily, QueueGroup},
     window::{Extent2D, PresentationSurface, Surface, SwapchainConfig},
@@ -50,6 +50,7 @@ use winit::{
 struct Vertex {
     position: [f32; 3],
     color: [f32; 3],
+    uv: [f32; 2],
 }
 
 #[allow(dead_code)]
@@ -164,21 +165,10 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             &memory_types,
         );
 
-        // create descriptors for uniforms
-        let descriptor_set_layout = Self::create_descriptor_set_layout(&device);
-        let (uniform_buffers, uniform_buffers_memory) =
-            Self::create_uniform_buffers(&device, &limits, &memory_types, frames_in_flight);
-        let mut descriptor_pool = Self::create_descriptor_pool(&device, frames_in_flight);
-        let descriptor_sets = Self::create_descriptor_sets(
-            &device,
-            &descriptor_set_layout,
-            &mut descriptor_pool,
-            &uniform_buffers,
-            frames_in_flight,
-        );
-
         let image = image::load(
-            Cursor::new(include_bytes!("../data/textures/ears.png")),
+            Cursor::new(include_bytes!(
+                "../data/textures/Ground037_1K-PNG/Ground037_1K_Color.png"
+            )),
             image::ImageFormat::Png,
         )
         .unwrap()
@@ -195,7 +185,20 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         let texture_image_view = Self::create_texture_image_view(&device, &texture_image);
         let texture_sampler = Self::create_texture_sampler(&device);
 
-        // used for uniforms and push constants in the future
+        let descriptor_set_layout = Self::create_descriptor_set_layout(&device);
+        let (uniform_buffers, uniform_buffers_memory) =
+            Self::create_uniform_buffers(&device, &limits, &memory_types, frames_in_flight);
+        let mut descriptor_pool = Self::create_descriptor_pool(&device, frames_in_flight);
+        let descriptor_sets = Self::create_descriptor_sets(
+            &device,
+            &descriptor_set_layout,
+            &mut descriptor_pool,
+            &uniform_buffers,
+            &texture_image_view,
+            &texture_sampler,
+            frames_in_flight,
+        );
+
         let pipeline_layout = ManuallyDrop::new(unsafe {
             device
                 .create_pipeline_layout(iter::once(&*descriptor_set_layout), iter::empty())
@@ -204,11 +207,11 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // shaders are compiled by build script
         let vertex_shader = gfx_auxil::read_spirv(Cursor::new(include_bytes!(
-            "../target/data/shaders/02_model_view_projection_3d.vert.spv"
+            "../target/data/shaders/03_model_view_projection_3d.vert.spv"
         )))
         .unwrap();
         let fragment_shader = gfx_auxil::read_spirv(Cursor::new(include_bytes!(
-            "../target/data/shaders/02_vertex_color.frag.spv"
+            "../target/data/shaders/03_texture_bg.frag.spv"
         )))
         .unwrap();
 
@@ -370,7 +373,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // rotate model with time
         let time = self.start_time.elapsed().as_secs_f32();
-        let model = Matrix4::<f32>::from_euler_angles(0.0, -time * 90.0, time);
+        let model = Matrix4::<f32>::from_euler_angles(0.0, -time, time);
 
         // place camera 2 units back and 1 each below and to the right, pointing at 0,0,0
         let view = Matrix4::<f32>::look_at_rh(
@@ -847,18 +850,30 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         ManuallyDrop::new(
             unsafe {
                 device.create_descriptor_set_layout(
-                    iter::once(DescriptorSetLayoutBinding {
-                        binding: 0,
-                        ty: DescriptorType::Buffer {
-                            ty: BufferDescriptorType::Uniform,
-                            format: BufferDescriptorFormat::Structured {
-                                dynamic_offset: false,
+                    vec![
+                        DescriptorSetLayoutBinding {
+                            binding: 0,
+                            ty: DescriptorType::Buffer {
+                                ty: BufferDescriptorType::Uniform,
+                                format: BufferDescriptorFormat::Structured {
+                                    dynamic_offset: false,
+                                },
                             },
+                            count: 1,
+                            stage_flags: ShaderStageFlags::VERTEX,
+                            immutable_samplers: false,
                         },
-                        count: 1,
-                        stage_flags: ShaderStageFlags::VERTEX,
-                        immutable_samplers: false,
-                    }),
+                        DescriptorSetLayoutBinding {
+                            binding: 1,
+                            ty: DescriptorType::Image {
+                                ty: ImageDescriptorType::Sampled { with_sampler: true },
+                            },
+                            count: 1,
+                            stage_flags: ShaderStageFlags::FRAGMENT,
+                            immutable_samplers: false,
+                        },
+                    ]
+                    .into_iter(),
                     iter::empty(),
                 )
             }
@@ -900,15 +915,27 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             unsafe {
                 device.create_descriptor_pool(
                     frames_in_flight,
-                    iter::once(DescriptorRangeDesc {
-                        ty: DescriptorType::Buffer {
-                            ty: BufferDescriptorType::Uniform,
-                            format: BufferDescriptorFormat::Structured {
-                                dynamic_offset: false,
+                    vec![
+                        DescriptorRangeDesc {
+                            ty: DescriptorType::Buffer {
+                                ty: BufferDescriptorType::Uniform,
+                                format: BufferDescriptorFormat::Structured {
+                                    dynamic_offset: false,
+                                },
                             },
+                            count: frames_in_flight, // we need one descriptor for each frame in flight
                         },
-                        count: frames_in_flight,
-                    }),
+                        DescriptorRangeDesc {
+                            ty: DescriptorType::Image {
+                                ty: ImageDescriptorType::Sampled { with_sampler: true },
+                            },
+                            // todo: theoretically no dedicated descriptor is needed for every frame in flight
+                            // since this one doesn't change every frame, we could share it
+                            // https://software.intel.com/content/www/us/en/develop/articles/practical-approach-to-vulkan-part-1.html
+                            count: frames_in_flight,
+                        },
+                    ]
+                    .into_iter(),
                     DescriptorPoolCreateFlags::empty(),
                 )
             }
@@ -921,6 +948,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         descriptor_set_layout: &B::DescriptorSetLayout,
         descriptor_pool: &mut B::DescriptorPool,
         uniform_buffers: &Vec<ManuallyDrop<B::Buffer>>,
+        image_view: &B::ImageView,
+        sampler: &B::Sampler,
         frames_in_flight: usize,
     ) -> Vec<B::DescriptorSet> {
         let mut descriptor_sets = Vec::with_capacity(frames_in_flight);
@@ -937,10 +966,16 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                     set: &mut descriptor_sets[i],
                     binding: 0,
                     array_offset: 0,
-                    descriptors: iter::once(Descriptor::Buffer(
-                        &*uniform_buffers[i],
-                        SubRange::WHOLE,
-                    )),
+                    descriptors: vec![
+                        Descriptor::Buffer(&*uniform_buffers[i], SubRange::WHOLE),
+                        // instead of a combined image sampler, we could also use a separate image and a sampler descriptor
+                        Descriptor::CombinedImageSampler(
+                            image_view,
+                            Layout::ShaderReadOnlyOptimal,
+                            sampler,
+                        ),
+                    ]
+                    .into_iter(),
                 })
             }
         }
@@ -1163,7 +1198,15 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                     binding: 0,
                     element: pso::Element {
                         format: Format::Rgb32Sfloat,
-                        offset: 8, // an offset_of library or offset_from may be considered here
+                        offset: 12, // an offset_of library or offset_from may be considered here
+                    },
+                },
+                AttributeDesc {
+                    location: 2,
+                    binding: 0,
+                    element: pso::Element {
+                        format: Format::Rg32Sfloat,
+                        offset: 24,
                     },
                 },
             ],
@@ -1282,15 +1325,15 @@ const DEFAULT_WINDOW_SIZE: [u32; 2] = [512, 512];
 
 #[cfg_attr(rustfmt, rustfmt_skip)]
 const VERTICES: [Vertex; 8] = [
-    Vertex { position: [-0.5, -0.5,  0.5], color: [1.0, 0.0, 0.0] },
-    Vertex { position: [-0.5,  0.5,  0.5], color: [0.0, 1.0, 0.0] },
-    Vertex { position: [ 0.5,  0.5,  0.5], color: [0.0, 0.0, 1.0] },
-    Vertex { position: [ 0.5, -0.5,  0.5], color: [1.0, 1.0, 1.0] },
+    Vertex { position: [-0.5, -0.5,  0.5], color: [1.0, 0.0, 0.0], uv: [1.0, 0.0] },
+    Vertex { position: [-0.5,  0.5,  0.5], color: [0.0, 1.0, 0.0], uv: [1.0, 1.0] },
+    Vertex { position: [ 0.5,  0.5,  0.5], color: [0.0, 0.0, 1.0], uv: [0.0, 1.0] },
+    Vertex { position: [ 0.5, -0.5,  0.5], color: [1.0, 1.0, 1.0], uv: [0.0, 0.0] },
 
-    Vertex { position: [-0.5, -0.5, -0.5], color: [1.0, 0.0, 0.0] },
-    Vertex { position: [-0.5,  0.5, -0.5], color: [0.0, 1.0, 0.0] },
-    Vertex { position: [ 0.5,  0.5, -0.5], color: [0.0, 0.0, 1.0] },
-    Vertex { position: [ 0.5, -0.5, -0.5], color: [1.0, 1.0, 1.0] },
+    Vertex { position: [-0.5, -0.5, -0.5], color: [1.0, 0.0, 0.0], uv: [1.0, 0.0] },
+    Vertex { position: [-0.5,  0.5, -0.5], color: [0.0, 1.0, 0.0], uv: [1.0, 1.0] },
+    Vertex { position: [ 0.5,  0.5, -0.5], color: [0.0, 0.0, 1.0], uv: [0.0, 1.0] },
+    Vertex { position: [ 0.5, -0.5, -0.5], color: [1.0, 1.0, 1.0], uv: [0.0, 0.0] },
 ];
 
 #[cfg_attr(rustfmt, rustfmt_skip)]
