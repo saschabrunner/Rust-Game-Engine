@@ -344,17 +344,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     }
 
     pub fn render(&mut self) {
-        let surface_image = unsafe {
-            let acquire_timeout_ns = 1_000_000_000;
-            match self.surface.acquire_image(acquire_timeout_ns) {
-                Ok((image, _)) => image,
-                Err(_) => {
-                    self.recreate_swapchain();
-                    return;
-                }
-            }
-        };
-
         let frame_id = (self.frame % self.frames_in_flight as u64) as usize;
         unsafe {
             // wait for the previous submission to finish before resetting command pool and preparing new frame
@@ -370,6 +359,17 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 .expect("Out of memory resetting fence");
             self.command_pools[frame_id].reset(false);
         }
+
+        let surface_image = unsafe {
+            let acquire_timeout_ns = 1_000_000_000;
+            match self.surface.acquire_image(acquire_timeout_ns) {
+                Ok((image, _)) => image,
+                Err(_) => {
+                    self.recreate_swapchain();
+                    return;
+                }
+            }
+        };
 
         // rotate model with time
         let time = self.start_time.elapsed().as_secs_f32();
@@ -442,6 +442,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             command_buffer.end_render_pass();
             command_buffer.finish();
 
+            // we don't need a wait semaphore here, since gfx-rs synchronizes acquire image internally already
             self.queue_group.queues[0].submit(
                 iter::once(&*command_buffer),
                 iter::empty(),
@@ -1324,26 +1325,47 @@ const APPLICATION_NAME: &'static str = "Rust Game Engine";
 const DEFAULT_WINDOW_SIZE: [u32; 2] = [512, 512];
 
 #[cfg_attr(rustfmt, rustfmt_skip)]
-const VERTICES: [Vertex; 8] = [
-    Vertex { position: [-0.5, -0.5,  0.5], color: [1.0, 0.0, 0.0], uv: [1.0, 0.0] },
-    Vertex { position: [-0.5,  0.5,  0.5], color: [0.0, 1.0, 0.0], uv: [1.0, 1.0] },
-    Vertex { position: [ 0.5,  0.5,  0.5], color: [0.0, 0.0, 1.0], uv: [0.0, 1.0] },
-    Vertex { position: [ 0.5, -0.5,  0.5], color: [1.0, 1.0, 1.0], uv: [0.0, 0.0] },
+const VERTICES: [Vertex; 24] = [
+    Vertex { position: [-0.5, -0.5,  0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },    // front
+    Vertex { position: [-0.5,  0.5,  0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
+    Vertex { position: [ 0.5,  0.5,  0.5], color: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
+    Vertex { position: [ 0.5, -0.5,  0.5], color: [1.0, 1.0, 1.0], uv: [1.0, 0.0] },
 
-    Vertex { position: [-0.5, -0.5, -0.5], color: [1.0, 0.0, 0.0], uv: [1.0, 0.0] },
-    Vertex { position: [-0.5,  0.5, -0.5], color: [0.0, 1.0, 0.0], uv: [1.0, 1.0] },
-    Vertex { position: [ 0.5,  0.5, -0.5], color: [0.0, 0.0, 1.0], uv: [0.0, 1.0] },
-    Vertex { position: [ 0.5, -0.5, -0.5], color: [1.0, 1.0, 1.0], uv: [0.0, 0.0] },
+    Vertex { position: [ 0.5, -0.5, -0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },    // back
+    Vertex { position: [ 0.5,  0.5, -0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
+    Vertex { position: [-0.5,  0.5, -0.5], color: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
+    Vertex { position: [-0.5, -0.5, -0.5], color: [1.0, 1.0, 1.0], uv: [1.0, 0.0] },
+
+    Vertex { position: [-0.5, -0.5, -0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },    // left
+    Vertex { position: [-0.5,  0.5, -0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
+    Vertex { position: [-0.5,  0.5,  0.5], color: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
+    Vertex { position: [-0.5, -0.5,  0.5], color: [1.0, 1.0, 1.0], uv: [1.0, 0.0] },
+
+    Vertex { position: [ 0.5, -0.5,  0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },    // right
+    Vertex { position: [ 0.5,  0.5,  0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
+    Vertex { position: [ 0.5,  0.5, -0.5], color: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
+    Vertex { position: [ 0.5, -0.5, -0.5], color: [1.0, 1.0, 1.0], uv: [1.0, 0.0] },
+
+    Vertex { position: [-0.5, -0.5, -0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },    // top
+    Vertex { position: [-0.5, -0.5,  0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
+    Vertex { position: [ 0.5, -0.5,  0.5], color: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
+    Vertex { position: [ 0.5, -0.5, -0.5], color: [1.0, 1.0, 1.0], uv: [1.0, 0.0] },
+
+    Vertex { position: [-0.5,  0.5,  0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },    // bottom
+    Vertex { position: [-0.5,  0.5, -0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
+    Vertex { position: [ 0.5,  0.5, -0.5], color: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
+    Vertex { position: [ 0.5,  0.5,  0.5], color: [1.0, 1.0, 1.0], uv: [1.0, 0.0] },
 ];
 
+// these indices must be counter-clockwise for backface culling to work
 #[cfg_attr(rustfmt, rustfmt_skip)]
 const INDICES: [u16; 36] = [
-    0, 1, 2, 0, 2, 3,   // front
-    7, 6, 5, 7, 5, 4,   // back
-    4, 5, 1, 4, 1, 0,   // left
-    3, 2, 6, 3, 6, 7,   // right
-    4, 0, 3, 4, 3, 7,   // top
-    1, 5, 6, 1, 6, 2,   // bottom
+     0,  1,  2,  0,  2,  3, // front
+     4,  5,  6,  4,  6,  7, // back
+     8,  9, 10,  8, 10, 11, // left
+    12, 13, 14, 12, 14, 15, // right
+    16, 17, 18, 16, 18, 19, // top
+    20, 21, 22, 20, 22, 23, // bottom
 ];
 
 fn main() {
