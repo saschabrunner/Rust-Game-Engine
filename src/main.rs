@@ -371,13 +371,17 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             }
         };
 
-        // rotate model with time
+        // rotate and move model with time
         let time = self.start_time.elapsed().as_secs_f32();
-        let model = Matrix4::<f32>::from_euler_angles(0.0, -time, time);
+        let model = Matrix4::<f32>::new_translation(&Vector3::<f32>::new(
+            (time * 0.5).sin() * 5.0,
+            (time * 0.7).sin() * 4.0,
+            (time * 0.8).sin() * 4.0,
+        )) * Matrix4::<f32>::from_euler_angles(0.0, -time, time);
 
-        // place camera 2 units back and 1 each below and to the right, pointing at 0,0,0
+        // place camera 10 units back and slightly to the side and down, pointing at 0,0,0
         let view = Matrix4::<f32>::look_at_rh(
-            &Point3::new(1.0, 1.0, 2.0),
+            &Point3::new(1.0, 5.0, 10.0),
             &Point3::new(0.0, 0.0, 0.0),
             &Vector3::new(0.0, 1.0, 0.0),
         );
@@ -386,7 +390,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             self.surface_extent.width as f32 / self.surface_extent.height as f32,
             0.9, // around 50° vertical fov
             0.1,
-            10.0,
+            100.0,
         );
 
         let transformations = Transformations {
