@@ -12,25 +12,29 @@ use gfx_hal::{
     adapter::{Adapter, MemoryType, PhysicalDevice},
     buffer::{self, SubRange},
     command::{
-        BufferCopy, BufferImageCopy, ClearColor, ClearValue, CommandBuffer, CommandBufferFlags,
-        Level, RenderAttachmentInfo, SubpassContents,
+        BufferCopy, BufferImageCopy, ClearColor, ClearDepthStencil, ClearValue, CommandBuffer,
+        CommandBufferFlags, Level, RenderAttachmentInfo, SubpassContents,
     },
     device::Device,
-    format::{Aspects, ChannelType, Format, Swizzle},
+    format::{Aspects, ChannelType, Format, ImageFeature, Swizzle},
     image::{
-        self as gfximg, Extent, Layout, SamplerDesc, SubresourceLayers, SubresourceRange,
-        ViewCapabilities, ViewKind,
+        self as gfximg, Extent, FramebufferAttachment, Layout, SamplerDesc, SubresourceLayers,
+        SubresourceRange, ViewCapabilities, ViewKind,
     },
     memory::{self, Segment, SparseFlags},
-    pass::{Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, Subpass, SubpassDesc},
+    pass::{
+        Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, Subpass, SubpassDependency,
+        SubpassDesc,
+    },
     pool::{CommandPool, CommandPoolCreateFlags},
     pso::{
         self, AttributeDesc, BlendState, BufferDescriptorFormat, BufferDescriptorType,
-        ColorBlendDesc, ColorMask, Descriptor, DescriptorPool, DescriptorPoolCreateFlags,
-        DescriptorRangeDesc, DescriptorSetLayoutBinding, DescriptorSetWrite, DescriptorType,
-        EntryPoint, Face, GraphicsPipelineDesc, ImageDescriptorType, InputAssemblerDesc,
-        PipelineStage, Primitive, PrimitiveAssemblerDesc, Rasterizer, Rect, ShaderStageFlags,
-        Specialization, VertexBufferDesc, VertexInputRate, Viewport,
+        ColorBlendDesc, ColorMask, DepthStencilDesc, DepthTest, Descriptor, DescriptorPool,
+        DescriptorPoolCreateFlags, DescriptorRangeDesc, DescriptorSetLayoutBinding,
+        DescriptorSetWrite, DescriptorType, EntryPoint, Face, GraphicsPipelineDesc,
+        ImageDescriptorType, InputAssemblerDesc, PipelineStage, Primitive, PrimitiveAssemblerDesc,
+        Rasterizer, Rect, ShaderStageFlags, Specialization, VertexBufferDesc, VertexInputRate,
+        Viewport,
     },
     queue::{Queue, QueueFamily, QueueGroup},
     window::{Extent2D, PresentationSurface, Surface, SwapchainConfig},
@@ -63,6 +67,7 @@ struct Transformations {
 struct Renderer<B: gfx_hal::Backend> {
     surface: ManuallyDrop<B::Surface>,
     surface_format: Format,
+    depth_format: Format,
     surface_extent: Extent2D,
     viewport: Viewport,
     render_pass: ManuallyDrop<B::RenderPass>,
@@ -75,15 +80,18 @@ struct Renderer<B: gfx_hal::Backend> {
     command_pools: Vec<B::CommandPool>,
     command_buffers: Vec<B::CommandBuffer>,
     texture_image_view: ManuallyDrop<B::ImageView>,
+    depth_image_view: ManuallyDrop<B::ImageView>,
     texture_sampler: ManuallyDrop<B::Sampler>,
     vertex_buffer: ManuallyDrop<B::Buffer>,
     index_buffer: ManuallyDrop<B::Buffer>,
     uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
     texture_image: ManuallyDrop<B::Image>,
+    depth_image: ManuallyDrop<B::Image>, //todo: per frame in flight
     vertex_buffer_memory: ManuallyDrop<B::Memory>,
     index_buffer_memory: ManuallyDrop<B::Memory>,
     uniform_buffers_memory: Vec<ManuallyDrop<B::Memory>>,
     texture_memory: ManuallyDrop<B::Memory>,
+    depth_image_memory: ManuallyDrop<B::Memory>,
     descriptor_set_layout: ManuallyDrop<B::DescriptorSetLayout>,
     descriptor_pool: ManuallyDrop<B::DescriptorPool>,
     descriptor_sets: Vec<B::DescriptorSet>,
@@ -147,23 +155,35 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         }
 
         let surface_format = Self::find_surface_format(physical_device, &surface);
-        let render_pass = Self::create_render_pass(&device, surface_format);
+        let depth_format = Self::find_depth_format(physical_device);
 
-        let (vertex_buffer, vertex_buffer_memory) = Self::create_vertex_buffer(
-            &device,
-            &mut queue_group,
-            &mut command_pools[0],
-            &limits,
-            &memory_types,
-        );
+        let default_surface_extent = Extent2D {
+            width: DEFAULT_WINDOW_SIZE[0],
+            height: DEFAULT_WINDOW_SIZE[1],
+        };
+        let capabilities = surface.capabilities(physical_device);
+        let swapchain_config =
+            SwapchainConfig::from_caps(&capabilities, surface_format, default_surface_extent);
+        let framebuffer_attachment = swapchain_config.framebuffer_attachment();
 
-        let (index_buffer, index_buffer_memory) = Self::create_index_buffer(
-            &device,
-            &mut queue_group,
-            &mut command_pools[0],
-            &limits,
-            &memory_types,
-        );
+        // update surface extent, since the swapchain might enforce different dimensions
+        let surface_extent = swapchain_config.extent;
+
+        let viewport = Viewport {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: surface_extent.width as i16,
+                h: surface_extent.height as i16,
+            },
+            depth: 0.0..1.0,
+        };
+
+        unsafe {
+            surface
+                .configure_swapchain(&device, swapchain_config)
+                .expect("Failed to configure swapchain");
+        }
 
         let image = image::load(
             Cursor::new(include_bytes!(
@@ -182,7 +202,13 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             &image,
         );
 
-        let texture_image_view = Self::create_texture_image_view(&device, &texture_image);
+        let texture_image_view = Self::create_image_view(
+            &device,
+            &texture_image,
+            Format::Rgba8Srgb,
+            Aspects::COLOR,
+            gfximg::Usage::SAMPLED,
+        );
         let texture_sampler = Self::create_texture_sampler(&device);
 
         let descriptor_set_layout = Self::create_descriptor_set_layout(&device);
@@ -197,6 +223,43 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             &texture_image_view,
             &texture_sampler,
             frames_in_flight,
+        );
+
+        let (depth_image, depth_image_memory) = Self::create_image(
+            &device,
+            &memory_types,
+            surface_extent.width,
+            surface_extent.height,
+            depth_format,
+            gfximg::Tiling::Optimal,
+            gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+            memory::Properties::DEVICE_LOCAL,
+        );
+
+        let depth_image_view = Self::create_image_view(
+            &device,
+            &depth_image,
+            depth_format,
+            Aspects::DEPTH, // todo: stencil aspect
+            gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+        );
+
+        let render_pass = Self::create_render_pass(&device, surface_format, depth_format);
+
+        let (vertex_buffer, vertex_buffer_memory) = Self::create_vertex_buffer(
+            &device,
+            &mut queue_group,
+            &mut command_pools[0],
+            &limits,
+            &memory_types,
+        );
+
+        let (index_buffer, index_buffer_memory) = Self::create_index_buffer(
+            &device,
+            &mut queue_group,
+            &mut command_pools[0],
+            &limits,
+            &memory_types,
         );
 
         let pipeline_layout = ManuallyDrop::new(unsafe {
@@ -225,45 +288,21 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             )
         };
 
-        let default_surface_extent = Extent2D {
-            width: DEFAULT_WINDOW_SIZE[0],
-            height: DEFAULT_WINDOW_SIZE[1],
-        };
-        let capabilities = surface.capabilities(physical_device);
-        let swapchain_config =
-            SwapchainConfig::from_caps(&capabilities, surface_format, default_surface_extent);
-
-        // update surface extent, since the swapchain might enforce different dimensions
-        let surface_extent = swapchain_config.extent;
-
-        let viewport = Viewport {
-            rect: Rect {
-                x: 0,
-                y: 0,
-                w: surface_extent.width as i16,
-                h: surface_extent.height as i16,
-            },
-            depth: 0.0..1.0,
-        };
-
-        let framebuffer_attachment = swapchain_config.framebuffer_attachment();
-
-        unsafe {
-            surface
-                .configure_swapchain(&device, swapchain_config)
-                .expect("Failed to configure swapchain");
-        }
-
         // framebuffer connects attachments to images
         // attachments can be thought of as the slots
         // and the images fill those slots.
         // gfx-rs uses imageless framebuffers,
         // we don't have to recreate them every frame.
+        let depth_attachment = FramebufferAttachment {
+            usage: gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+            view_caps: ViewCapabilities::empty(),
+            format: depth_format,
+        };
         let framebuffer = ManuallyDrop::new(unsafe {
             device
                 .create_framebuffer(
                     &render_pass,
-                    iter::once(framebuffer_attachment),
+                    vec![framebuffer_attachment, depth_attachment].into_iter(),
                     Extent {
                         width: surface_extent.width,
                         height: surface_extent.height,
@@ -276,6 +315,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         Renderer {
             surface: ManuallyDrop::new(surface),
             surface_format,
+            depth_format,
             surface_extent,
             viewport,
             render_pass,
@@ -287,15 +327,18 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             command_pools,
             command_buffers,
             texture_image_view,
+            depth_image_view,
             texture_sampler,
             vertex_buffer,
             index_buffer,
             uniform_buffers,
             texture_image,
+            depth_image,
             vertex_buffer_memory,
             index_buffer_memory,
             uniform_buffers_memory,
             texture_memory,
+            depth_image_memory,
             descriptor_set_layout,
             descriptor_pool,
             descriptor_sets,
@@ -323,14 +366,29 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         unsafe {
             self.device.wait_idle().unwrap();
 
-            // re-create framebuffer
+            // destroy resources about to be recreated
             self.device
                 .destroy_framebuffer(ManuallyDrop::take(&mut self.framebuffer));
+            self.device
+                .destroy_image_view(ManuallyDrop::take(&mut self.depth_image_view));
+            self.device
+                .destroy_image(ManuallyDrop::take(&mut self.depth_image));
+            self.device
+                .free_memory(ManuallyDrop::take(&mut self.depth_image_memory));
+
+            let depth_attachment = FramebufferAttachment {
+                usage: gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+                view_caps: ViewCapabilities::empty(),
+                format: self.depth_format,
+            };
+
+            // recreate framebuffer
             self.framebuffer = ManuallyDrop::new(
                 self.device
                     .create_framebuffer(
                         &self.render_pass,
-                        iter::once(swapchain_config.framebuffer_attachment()),
+                        vec![swapchain_config.framebuffer_attachment(), depth_attachment]
+                            .into_iter(),
                         self.surface_extent.to_extent(),
                     )
                     .unwrap(),
@@ -340,6 +398,34 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             self.surface
                 .configure_swapchain(&self.device, swapchain_config)
                 .expect("Failed to configure swapchain");
+
+            // recreate depth buffer
+            let (depth_image, depth_image_memory) = Self::create_image(
+                &self.device,
+                &self
+                    .adapter
+                    .physical_device
+                    .memory_properties()
+                    .memory_types,
+                self.surface_extent.width,
+                self.surface_extent.height,
+                self.depth_format,
+                gfximg::Tiling::Optimal,
+                gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+                memory::Properties::DEVICE_LOCAL,
+            );
+
+            let depth_image_view = Self::create_image_view(
+                &self.device,
+                &depth_image,
+                self.depth_format,
+                Aspects::DEPTH, // todo: stencil aspect
+                gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+            );
+
+            self.depth_image = depth_image;
+            self.depth_image_memory = depth_image_memory;
+            self.depth_image_view = depth_image_view;
         }
     }
 
@@ -432,14 +518,26 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 &self.framebuffer,
                 self.viewport.rect,
                 // clear value is part of each render attachment info
-                iter::once(RenderAttachmentInfo {
-                    image_view: surface_image.borrow(), // borrow returns borrow of diff type
-                    clear_value: ClearValue {
-                        color: ClearColor {
-                            float32: [0.0, 0.0, 0.0, 1.0],
+                vec![
+                    RenderAttachmentInfo {
+                        image_view: surface_image.borrow(), // borrow returns borrow of diff type
+                        clear_value: ClearValue {
+                            color: ClearColor {
+                                float32: [0.0, 0.0, 0.0, 1.0],
+                            },
                         },
                     },
-                }),
+                    RenderAttachmentInfo {
+                        image_view: &*self.depth_image_view, // borrow only works for SwapchainImage
+                        clear_value: ClearValue {
+                            depth_stencil: ClearDepthStencil {
+                                depth: 1.0,
+                                stencil: 0,
+                            },
+                        },
+                    },
+                ]
+                .into_iter(),
                 SubpassContents::Inline,
             );
             command_buffer.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
@@ -487,6 +585,48 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             .into_iter()
             .find(|format| format.base_format().1 == ChannelType::Srgb)
             .unwrap_or(default_format)
+    }
+
+    fn find_compatible_format<'a, I: Iterator<Item = &'a Format>>(
+        physical_device: &B::PhysicalDevice,
+        candidates: I,
+        tiling: gfximg::Tiling,
+        features: ImageFeature,
+    ) -> Option<Format> {
+        for candidate in candidates {
+            let properties = physical_device.format_properties(Some(*candidate));
+            match tiling {
+                gfximg::Tiling::Optimal => {
+                    if properties.optimal_tiling & features == features {
+                        return Some(*candidate);
+                    }
+                }
+                gfximg::Tiling::Linear => {
+                    if properties.linear_tiling & features == features {
+                        return Some(*candidate);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn find_depth_format(physical_device: &B::PhysicalDevice) -> Format {
+        // could probably be rewritten by iterating through all of the available formats and calling
+        // is_depth on them
+        Self::find_compatible_format(
+            physical_device,
+            vec![
+                Format::D32Sfloat,
+                Format::D24UnormS8Uint,
+                Format::D32SfloatS8Uint,
+            ]
+            .iter(),
+            gfximg::Tiling::Optimal,
+            ImageFeature::DEPTH_STENCIL_ATTACHMENT,
+        )
+        .expect("Couldn't finad a compatible depth format.")
     }
 
     fn create_buffer(
@@ -560,11 +700,23 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         queue_group: &mut QueueGroup<B>,
         command_pool: &mut B::CommandPool,
         image: &B::Image,
+        format: Format,
         layouts: Range<Layout>,
     ) {
         let mut command_fence = device
             .create_fence(false)
             .expect("Out of memory creating fence");
+
+        let aspects = if layouts.end == Layout::DepthStencilAttachmentOptimal {
+            let mut val = Aspects::DEPTH;
+
+            if Format::is_stencil(format) {
+                val |= Aspects::STENCIL;
+            }
+            val
+        } else {
+            Aspects::COLOR
+        };
 
         let (stages, accesses) =
             if layouts.start == Layout::Undefined && layouts.end == Layout::TransferDstOptimal {
@@ -578,6 +730,14 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 Some((
                     PipelineStage::TRANSFER..PipelineStage::FRAGMENT_SHADER,
                     gfximg::Access::TRANSFER_WRITE..gfximg::Access::SHADER_READ,
+                ))
+            } else if layouts.start == Layout::Undefined
+                && layouts.end == Layout::DepthStencilAttachmentOptimal
+            {
+                Some((
+                    PipelineStage::TOP_OF_PIPE..PipelineStage::EARLY_FRAGMENT_TESTS,
+                    gfximg::Access::DEPTH_STENCIL_ATTACHMENT_READ
+                        ..gfximg::Access::DEPTH_STENCIL_ATTACHMENT_WRITE,
                 ))
             } else {
                 None
@@ -601,7 +761,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                     states: (accesses.start, layouts.start)..(accesses.end, layouts.end),
                     target: image,
                     range: SubresourceRange {
-                        aspects: Aspects::COLOR,
+                        aspects: aspects,
                         level_start: 0,
                         level_count: None,
                         layer_start: 0,
@@ -1035,6 +1195,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             queue_group,
             command_pool,
             &texture_image,
+            Format::Rgba8Srgb,
             Layout::Undefined..Layout::TransferDstOptimal,
         );
 
@@ -1055,6 +1216,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             queue_group,
             command_pool,
             &texture_image,
+            Format::Rgba8Srgb,
             Layout::TransferDstOptimal..Layout::ShaderReadOnlyOptimal,
         );
 
@@ -1066,20 +1228,23 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         (texture_image, texture_memory)
     }
 
-    fn create_texture_image_view(
+    fn create_image_view(
         device: &B::Device,
         image: &B::Image,
+        format: Format,
+        aspects: Aspects,
+        usage: gfximg::Usage,
     ) -> ManuallyDrop<B::ImageView> {
         ManuallyDrop::new(
             unsafe {
                 device.create_image_view(
                     image,
                     ViewKind::D2,
-                    Format::Rgba8Srgb,
+                    format,
                     Swizzle::NO,
-                    gfximg::Usage::SAMPLED,
+                    usage,
                     SubresourceRange {
-                        aspects: Aspects::COLOR,
+                        aspects: aspects,
                         level_start: 0,
                         level_count: None,
                         layer_start: 0,
@@ -1125,6 +1290,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     fn create_render_pass(
         device: &B::Device,
         surface_color_format: Format,
+        depth_format: Format,
     ) -> ManuallyDrop<B::RenderPass> {
         // https://vulkan-tutorial.com/en/Drawing_a_triangle/Graphics_pipeline_basics/Render_passes
         let color_attachment = Attachment {
@@ -1135,20 +1301,38 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             layouts: Layout::Undefined..Layout::Present, // don't mind layout at the start, but want to present at end
         };
 
+        let depth_attachment = Attachment {
+            format: Some(depth_format),
+            samples: 1,
+            ops: AttachmentOps::new(AttachmentLoadOp::Clear, AttachmentStoreOp::DontCare),
+            stencil_ops: AttachmentOps::DONT_CARE,
+            layouts: Layout::Undefined..Layout::DepthStencilAttachmentOptimal,
+        };
+
         let subpass = SubpassDesc {
             colors: &[(0, Layout::ColorAttachmentOptimal)],
-            depth_stencil: None,
+            depth_stencil: Some(&(1, Layout::DepthStencilAttachmentOptimal)),
             inputs: &[],
             resolves: &[],
             preserves: &[],
         };
 
+        let dependency = SubpassDependency {
+            passes: None..Some(0),
+            stages: PipelineStage::COLOR_ATTACHMENT_OUTPUT | PipelineStage::EARLY_FRAGMENT_TESTS
+                ..PipelineStage::COLOR_ATTACHMENT_OUTPUT | PipelineStage::EARLY_FRAGMENT_TESTS,
+            accesses: gfximg::Access::empty()
+                ..gfximg::Access::COLOR_ATTACHMENT_WRITE
+                    | gfximg::Access::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            flags: memory::Dependencies::empty(),
+        };
+
         ManuallyDrop::new(unsafe {
             device
                 .create_render_pass(
-                    iter::once(color_attachment),
+                    vec![color_attachment, depth_attachment].into_iter(),
                     iter::once(subpass),
-                    iter::empty(),
+                    iter::once(dependency),
                 )
                 .expect("Out of memory creating render pass")
         })
@@ -1235,6 +1419,15 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             },
         );
 
+        pipeline_desc.depth_stencil = DepthStencilDesc {
+            depth: Some(DepthTest {
+                fun: gfx_hal::pso::Comparison::Less,
+                write: true,
+            }),
+            depth_bounds: false,
+            stencil: None,
+        };
+
         pipeline_desc.blender.targets.push(ColorBlendDesc {
             mask: ColorMask::ALL,
             blend: Some(BlendState::ALPHA),
@@ -1279,6 +1472,9 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                 .destroy_sampler(ManuallyDrop::take(&mut self.texture_sampler));
 
             self.device
+                .destroy_image_view(ManuallyDrop::take(&mut self.depth_image_view));
+
+            self.device
                 .destroy_buffer(ManuallyDrop::take(&mut self.vertex_buffer));
             self.device
                 .destroy_buffer(ManuallyDrop::take(&mut self.index_buffer));
@@ -1286,8 +1482,11 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                 self.device
                     .destroy_buffer(ManuallyDrop::take(uniform_buffer));
             }
+
             self.device
                 .destroy_image(ManuallyDrop::take(&mut self.texture_image));
+            self.device
+                .destroy_image(ManuallyDrop::take(&mut self.depth_image));
 
             self.device
                 .free_memory(ManuallyDrop::take(&mut self.vertex_buffer_memory));
@@ -1299,6 +1498,8 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
             }
             self.device
                 .free_memory(ManuallyDrop::take(&mut self.texture_memory));
+            self.device
+                .free_memory(ManuallyDrop::take(&mut self.depth_image_memory));
 
             self.device
                 .destroy_descriptor_pool(ManuallyDrop::take(&mut self.descriptor_pool));
