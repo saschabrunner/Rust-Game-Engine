@@ -1,3 +1,5 @@
+mod camera;
+
 use std::{
     borrow::Borrow,
     io::Cursor,
@@ -45,9 +47,11 @@ use nalgebra::{Matrix4, Point3, Vector3};
 
 use winit::{
     dpi::LogicalSize,
-    event::{Event, WindowEvent},
+    event::{DeviceEvent, ElementState, Event, KeyboardInput, VirtualKeyCode, WindowEvent},
     event_loop::ControlFlow,
 };
+
+use camera::{Camera, CameraDesc};
 
 // not dead code, we use memcpy on these structs
 #[allow(dead_code)]
@@ -65,6 +69,7 @@ struct Transformations {
 }
 
 struct Renderer<B: gfx_hal::Backend> {
+    camera: Camera,
     surface: ManuallyDrop<B::Surface>,
     surface_format: Format,
     depth_format: Format,
@@ -312,7 +317,16 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 .unwrap()
         });
 
+        let camera = Camera::new(
+            &CameraDesc {
+                position: Point3::new(0.0, 0.0, -5.0),
+                ..CameraDesc::default()
+            },
+            surface_extent,
+        );
+
         Renderer {
+            camera,
             surface: ManuallyDrop::new(surface),
             surface_format,
             depth_format,
@@ -398,35 +412,37 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             self.surface
                 .configure_swapchain(&self.device, swapchain_config)
                 .expect("Failed to configure swapchain");
-
-            // recreate depth buffer
-            let (depth_image, depth_image_memory) = Self::create_image(
-                &self.device,
-                &self
-                    .adapter
-                    .physical_device
-                    .memory_properties()
-                    .memory_types,
-                self.surface_extent.width,
-                self.surface_extent.height,
-                self.depth_format,
-                gfximg::Tiling::Optimal,
-                gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
-                memory::Properties::DEVICE_LOCAL,
-            );
-
-            let depth_image_view = Self::create_image_view(
-                &self.device,
-                &depth_image,
-                self.depth_format,
-                Aspects::DEPTH, // todo: stencil aspect
-                gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
-            );
-
-            self.depth_image = depth_image;
-            self.depth_image_memory = depth_image_memory;
-            self.depth_image_view = depth_image_view;
         }
+
+        // recreate depth buffer
+        let (depth_image, depth_image_memory) = Self::create_image(
+            &self.device,
+            &self
+                .adapter
+                .physical_device
+                .memory_properties()
+                .memory_types,
+            self.surface_extent.width,
+            self.surface_extent.height,
+            self.depth_format,
+            gfximg::Tiling::Optimal,
+            gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+            memory::Properties::DEVICE_LOCAL,
+        );
+
+        let depth_image_view = Self::create_image_view(
+            &self.device,
+            &depth_image,
+            self.depth_format,
+            Aspects::DEPTH, // todo: stencil aspect
+            gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+        );
+
+        self.depth_image = depth_image;
+        self.depth_image_memory = depth_image_memory;
+        self.depth_image_view = depth_image_view;
+
+        self.camera.set_surface_extent(self.surface_extent);
     }
 
     pub fn render(&mut self) {
@@ -465,19 +481,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             (time * 0.8).sin() * 4.0,
         )) * Matrix4::<f32>::from_euler_angles(0.0, -time, time);
 
-        // place camera 10 units back and slightly to the side and down, pointing at 0,0,0
-        let view = Matrix4::<f32>::look_at_rh(
-            &Point3::new(1.0, 5.0, 10.0),
-            &Point3::new(0.0, 0.0, 0.0),
-            &Vector3::new(0.0, 1.0, 0.0),
-        );
-
-        let projection = Matrix4::<f32>::new_perspective(
-            self.surface_extent.width as f32 / self.surface_extent.height as f32,
-            0.9, // around 50° vertical fov
-            0.1,
-            100.0,
-        );
+        let view = self.camera.get_view();
+        let projection = self.camera.get_projection();
 
         let transformations = Transformations {
             model,
@@ -1583,6 +1588,9 @@ fn main() {
         .build(&event_loop)
         .expect("Failed to create window");
 
+    window.set_cursor_grab(true).unwrap();
+    window.set_cursor_visible(false);
+
     let instance = backend::Instance::create(APPLICATION_NAME, 1).expect("Backend not supported");
 
     // surface creation is unsafe because raw window handle might be invalid pointer
@@ -1612,6 +1620,28 @@ fn main() {
                     height: new_inner_size.height,
                 };
                 renderer.recreate_swapchain();
+            }
+            WindowEvent::KeyboardInput { input, .. } => match input {
+                KeyboardInput {
+                    state: ElementState::Pressed,
+                    virtual_keycode: Some(key),
+                    ..
+                } => match key {
+                    // todo: build key tracking input system around it? DeviceEvent::Key instead maybe?
+                    VirtualKeyCode::W => renderer.camera.translate(0.0, 1.0),
+                    VirtualKeyCode::A => renderer.camera.translate(-1.0, 0.0),
+                    VirtualKeyCode::S => renderer.camera.translate(0.0, -1.0),
+                    VirtualKeyCode::D => renderer.camera.translate(1.0, 0.0),
+                    VirtualKeyCode::Escape => *control_flow = ControlFlow::Exit,
+                    _ => (),
+                },
+                _ => (),
+            },
+            _ => (),
+        },
+        Event::DeviceEvent { event, .. } => match event {
+            DeviceEvent::MouseMotion { delta } => {
+                renderer.camera.rotate(delta.0 as f32, delta.1 as f32)
             }
             _ => (),
         },
