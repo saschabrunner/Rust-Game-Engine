@@ -68,6 +68,45 @@ struct Transformations {
     projection: Matrix4<f32>,
 }
 
+struct ModelTransform<B: gfx_hal::Backend> {
+    model: Matrix4<f32>,
+    buffer: Buffer<B>,
+}
+
+struct ViewProjectionTransform<B: gfx_hal::Backend> {
+    view: Matrix4<f32>,
+    projection: Matrix4<f32>,
+    buffer: Buffer<B>,
+}
+
+struct Buffer<B: gfx_hal::Backend> {
+    buffer: ManuallyDrop<B::Buffer>,
+    memory: ManuallyDrop<B::Memory>,
+}
+
+struct Image<B: gfx_hal::Backend> {
+    image: ManuallyDrop<B::Image>,
+    memory: ManuallyDrop<B::Memory>,
+}
+
+struct Texture<B: gfx_hal::Backend> {
+    image: Image<B>,
+    image_view: ManuallyDrop<B::ImageView>,
+    sampler: ManuallyDrop<B::Sampler>, // TODO: make this sharable between textures
+}
+
+struct Model<B: gfx_hal::Backend> {
+    vertex_buffer: Buffer<B>,
+    index_buffer: Buffer<B>,
+    model_transforms: Vec<ModelTransform<B>>, // unique, per frame in flight
+    view_projection_transform: Vec<ViewProjectionTransform<B>>, // shared, per frame in flight
+}
+
+struct Material<B: gfx_hal::Backend> {
+    descriptor_sets: Vec<B::DescriptorSet>, // dependent on frames in flight
+                                            // todo: different shader pipelines
+}
+
 struct Renderer<B: gfx_hal::Backend> {
     camera: Camera,
     surface: ManuallyDrop<B::Surface>,
@@ -84,16 +123,17 @@ struct Renderer<B: gfx_hal::Backend> {
     submission_complete_fences: Vec<B::Fence>,
     command_pools: Vec<B::CommandPool>,
     command_buffers: Vec<B::CommandBuffer>,
-    texture_image_view: ManuallyDrop<B::ImageView>,
+    //texture_image_view: ManuallyDrop<B::ImageView>,
     depth_image_view: ManuallyDrop<B::ImageView>,
-    texture_sampler: ManuallyDrop<B::Sampler>,
+    //texture_sampler: ManuallyDrop<B::Sampler>,
     vertex_buffer: ManuallyDrop<B::Buffer>,
     index_buffer: ManuallyDrop<B::Buffer>,
     uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
     floor_vertex_buffer: ManuallyDrop<B::Buffer>,
     floor_index_buffer: ManuallyDrop<B::Buffer>,
     floor_uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
-    texture_image: ManuallyDrop<B::Image>,
+    //texture_image: ManuallyDrop<B::Image>,
+    texture: Texture<B>,
     depth_image: ManuallyDrop<B::Image>, //todo: per frame in flight
     vertex_buffer_memory: ManuallyDrop<B::Memory>,
     index_buffer_memory: ManuallyDrop<B::Memory>,
@@ -101,7 +141,7 @@ struct Renderer<B: gfx_hal::Backend> {
     floor_vertex_buffer_memory: ManuallyDrop<B::Memory>,
     floor_index_buffer_memory: ManuallyDrop<B::Memory>,
     floor_uniform_buffers_memory: Vec<ManuallyDrop<B::Memory>>,
-    texture_memory: ManuallyDrop<B::Memory>,
+    //texture_memory: ManuallyDrop<B::Memory>,
     depth_image_memory: ManuallyDrop<B::Memory>,
     descriptor_set_layout: ManuallyDrop<B::DescriptorSetLayout>,
     descriptor_pool: ManuallyDrop<B::DescriptorPool>,
@@ -205,7 +245,25 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         )
         .unwrap()
         .to_rgba8();
-        let (texture_image, texture_memory) = Self::create_texture_image(
+        // let (texture_image, texture_memory) = Self::create_texture_image(
+        //     &device,
+        //     &mut queue_group,
+        //     &mut command_pools[0],
+        //     &limits,
+        //     &memory_types,
+        //     &image,
+        // );
+
+        // let texture_image_view = Self::create_image_view(
+        //     &device,
+        //     &texture_image,
+        //     Format::Rgba8Srgb,
+        //     Aspects::COLOR,
+        //     gfximg::Usage::SAMPLED,
+        // );
+        // let texture_sampler = Self::create_texture_sampler(&device);
+
+        let texture = Self::create_texture(
             &device,
             &mut queue_group,
             &mut command_pools[0],
@@ -213,15 +271,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             &memory_types,
             &image,
         );
-
-        let texture_image_view = Self::create_image_view(
-            &device,
-            &texture_image,
-            Format::Rgba8Srgb,
-            Aspects::COLOR,
-            gfximg::Usage::SAMPLED,
-        );
-        let texture_sampler = Self::create_texture_sampler(&device);
 
         let descriptor_set_layout = Self::create_descriptor_set_layout(&device);
         let (uniform_buffers, uniform_buffers_memory) =
@@ -232,8 +281,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             &descriptor_set_layout,
             &mut descriptor_pool,
             &uniform_buffers,
-            &texture_image_view,
-            &texture_sampler,
+            &texture.image_view, // todo: make single arg
+            &texture.sampler,
             frames_in_flight,
         );
 
@@ -299,8 +348,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             &descriptor_set_layout,
             &mut descriptor_pool,
             &floor_uniform_buffers,
-            &texture_image_view,
-            &texture_sampler,
+            &texture.image_view, // todo: make single arg
+            &texture.sampler,
             frames_in_flight,
         );
 
@@ -377,16 +426,17 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             submission_complete_fences,
             command_pools,
             command_buffers,
-            texture_image_view,
+            //texture_image_view,
+            texture,
             depth_image_view,
-            texture_sampler,
+            //texture_sampler,
             vertex_buffer,
             index_buffer,
             uniform_buffers,
             floor_vertex_buffer,
             floor_index_buffer,
             floor_uniform_buffers,
-            texture_image,
+            //texture_image,
             depth_image,
             vertex_buffer_memory,
             index_buffer_memory,
@@ -394,7 +444,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             floor_vertex_buffer_memory,
             floor_index_buffer_memory,
             floor_uniform_buffers_memory,
-            texture_memory,
+            //texture_memory,
             depth_image_memory,
             descriptor_set_layout,
             descriptor_pool,
@@ -1238,14 +1288,94 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         descriptor_sets
     }
 
-    fn create_texture_image(
+    // fn create_texture_image(
+    //     device: &B::Device,
+    //     queue_group: &mut QueueGroup<B>,
+    //     command_pool: &mut B::CommandPool,
+    //     limits: &gfx_hal::Limits,
+    //     memory_types: &[MemoryType],
+    //     raw_image: &image::RgbaImage,
+    // ) -> (ManuallyDrop<B::Image>, ManuallyDrop<B::Memory>) {
+    //     let buffer_len = raw_image.width() * raw_image.height() * 4;
+    //     let padded_buffer_len = ((buffer_len as usize + limits.non_coherent_atom_size - 1)
+    //         / limits.non_coherent_atom_size
+    //         * limits.non_coherent_atom_size) as u64;
+
+    //     let (staging_buffer, mut staging_memory) = Self::create_buffer(
+    //         &device,
+    //         &memory_types,
+    //         padded_buffer_len,
+    //         buffer::Usage::TRANSFER_SRC,
+    //         memory::Properties::CPU_VISIBLE,
+    //     );
+
+    //     unsafe {
+    //         Self::copy_into_memory(
+    //             &device,
+    //             raw_image.as_ptr(),
+    //             &mut staging_memory,
+    //             buffer_len as usize,
+    //         )
+    //     };
+
+    //     let (texture_image, texture_memory) = Self::create_image(
+    //         &device,
+    //         &memory_types,
+    //         raw_image.width(),
+    //         raw_image.height(),
+    //         Format::Rgba8Srgb,
+    //         gfximg::Tiling::Optimal,
+    //         gfximg::Usage::TRANSFER_DST | gfximg::Usage::SAMPLED,
+    //         memory::Properties::DEVICE_LOCAL,
+    //     );
+
+    //     // transition to transfer destination layout
+    //     Self::transition_image_layout(
+    //         &device,
+    //         queue_group,
+    //         command_pool,
+    //         &texture_image,
+    //         Format::Rgba8Srgb,
+    //         Layout::Undefined..Layout::TransferDstOptimal,
+    //     );
+
+    //     // copy buffer to image
+    //     Self::copy_buffer_to_image(
+    //         &device,
+    //         queue_group,
+    //         &staging_buffer,
+    //         &texture_image,
+    //         command_pool,
+    //         raw_image.width(),
+    //         raw_image.height(),
+    //     );
+
+    //     // transition image to shader read layout
+    //     Self::transition_image_layout(
+    //         &device,
+    //         queue_group,
+    //         command_pool,
+    //         &texture_image,
+    //         Format::Rgba8Srgb,
+    //         Layout::TransferDstOptimal..Layout::ShaderReadOnlyOptimal,
+    //     );
+
+    //     unsafe {
+    //         device.destroy_buffer(ManuallyDrop::into_inner(staging_buffer));
+    //         device.free_memory(ManuallyDrop::into_inner(staging_memory));
+    //     }
+
+    //     (texture_image, texture_memory)
+    // }
+
+    fn create_texture(
         device: &B::Device,
         queue_group: &mut QueueGroup<B>,
         command_pool: &mut B::CommandPool,
         limits: &gfx_hal::Limits,
         memory_types: &[MemoryType],
         raw_image: &image::RgbaImage,
-    ) -> (ManuallyDrop<B::Image>, ManuallyDrop<B::Memory>) {
+    ) -> Texture<B> {
         let buffer_len = raw_image.width() * raw_image.height() * 4;
         let padded_buffer_len = ((buffer_len as usize + limits.non_coherent_atom_size - 1)
             / limits.non_coherent_atom_size
@@ -1268,6 +1398,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             )
         };
 
+        // todo: refactor create_image to return Image<B>
         let (texture_image, texture_memory) = Self::create_image(
             &device,
             &memory_types,
@@ -1315,7 +1446,23 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             device.free_memory(ManuallyDrop::into_inner(staging_memory));
         }
 
-        (texture_image, texture_memory)
+        let texture_image_view = Self::create_image_view(
+            &device,
+            &texture_image,
+            Format::Rgba8Srgb,
+            Aspects::COLOR,
+            gfximg::Usage::SAMPLED,
+        );
+        let texture_sampler = Self::create_texture_sampler(&device);
+
+        Texture {
+            image: Image {
+                image: texture_image,
+                memory: texture_memory,
+            },
+            image_view: texture_image_view,
+            sampler: texture_sampler,
+        }
     }
 
     fn create_image_view(
@@ -1556,10 +1703,11 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                 self.device.destroy_fence(submission_complete_fence);
             }
 
+            // todo: move drop implementation into specific structs
             self.device
-                .destroy_image_view(ManuallyDrop::take(&mut self.texture_image_view));
+                .destroy_image_view(ManuallyDrop::take(&mut self.texture.image_view));
             self.device
-                .destroy_sampler(ManuallyDrop::take(&mut self.texture_sampler));
+                .destroy_sampler(ManuallyDrop::take(&mut self.texture.sampler));
 
             self.device
                 .destroy_image_view(ManuallyDrop::take(&mut self.depth_image_view));
@@ -1582,7 +1730,7 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
             }
 
             self.device
-                .destroy_image(ManuallyDrop::take(&mut self.texture_image));
+                .destroy_image(ManuallyDrop::take(&mut self.texture.image.image));
             self.device
                 .destroy_image(ManuallyDrop::take(&mut self.depth_image));
 
@@ -1603,7 +1751,7 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                     .free_memory(ManuallyDrop::take(floor_uniform_buffer_memory));
             }
             self.device
-                .free_memory(ManuallyDrop::take(&mut self.texture_memory));
+                .free_memory(ManuallyDrop::take(&mut self.texture.image.memory));
             self.device
                 .free_memory(ManuallyDrop::take(&mut self.depth_image_memory));
 
