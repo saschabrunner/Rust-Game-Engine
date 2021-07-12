@@ -90,16 +90,23 @@ struct Renderer<B: gfx_hal::Backend> {
     vertex_buffer: ManuallyDrop<B::Buffer>,
     index_buffer: ManuallyDrop<B::Buffer>,
     uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
+    floor_vertex_buffer: ManuallyDrop<B::Buffer>,
+    floor_index_buffer: ManuallyDrop<B::Buffer>,
+    floor_uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
     texture_image: ManuallyDrop<B::Image>,
     depth_image: ManuallyDrop<B::Image>, //todo: per frame in flight
     vertex_buffer_memory: ManuallyDrop<B::Memory>,
     index_buffer_memory: ManuallyDrop<B::Memory>,
     uniform_buffers_memory: Vec<ManuallyDrop<B::Memory>>,
+    floor_vertex_buffer_memory: ManuallyDrop<B::Memory>,
+    floor_index_buffer_memory: ManuallyDrop<B::Memory>,
+    floor_uniform_buffers_memory: Vec<ManuallyDrop<B::Memory>>,
     texture_memory: ManuallyDrop<B::Memory>,
     depth_image_memory: ManuallyDrop<B::Memory>,
     descriptor_set_layout: ManuallyDrop<B::DescriptorSetLayout>,
     descriptor_pool: ManuallyDrop<B::DescriptorPool>,
     descriptor_sets: Vec<B::DescriptorSet>,
+    floor_descriptor_sets: Vec<B::DescriptorSet>,
     frames_in_flight: usize,
     frame: u64,
     start_time: Instant,
@@ -257,6 +264,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             &mut command_pools[0],
             &limits,
             &memory_types,
+            &CUBE_VERTICES,
         );
 
         let (index_buffer, index_buffer_memory) = Self::create_index_buffer(
@@ -265,6 +273,35 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             &mut command_pools[0],
             &limits,
             &memory_types,
+            &CUBE_INDICES,
+        );
+
+        let (floor_vertex_buffer, floor_vertex_buffer_memory) = Self::create_vertex_buffer(
+            &device,
+            &mut queue_group,
+            &mut command_pools[0],
+            &limits,
+            &memory_types,
+            &QUAD_VERTICES,
+        );
+        let (floor_index_buffer, floor_index_buffer_memory) = Self::create_index_buffer(
+            &device,
+            &mut queue_group,
+            &mut command_pools[0],
+            &limits,
+            &memory_types,
+            &QUAD_INDICES,
+        );
+        let (floor_uniform_buffers, floor_uniform_buffers_memory) =
+            Self::create_uniform_buffers(&device, &limits, &memory_types, frames_in_flight);
+        let floor_descriptor_sets = Self::create_descriptor_sets(
+            &device,
+            &descriptor_set_layout,
+            &mut descriptor_pool,
+            &floor_uniform_buffers,
+            &texture_image_view,
+            &texture_sampler,
+            frames_in_flight,
         );
 
         let pipeline_layout = ManuallyDrop::new(unsafe {
@@ -346,16 +383,23 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             vertex_buffer,
             index_buffer,
             uniform_buffers,
+            floor_vertex_buffer,
+            floor_index_buffer,
+            floor_uniform_buffers,
             texture_image,
             depth_image,
             vertex_buffer_memory,
             index_buffer_memory,
             uniform_buffers_memory,
+            floor_vertex_buffer_memory,
+            floor_index_buffer_memory,
+            floor_uniform_buffers_memory,
             texture_memory,
             depth_image_memory,
             descriptor_set_layout,
             descriptor_pool,
             descriptor_sets,
+            floor_descriptor_sets,
             frames_in_flight,
             frame: 0,
             start_time: Instant::now(),
@@ -528,7 +572,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                         image_view: surface_image.borrow(), // borrow returns borrow of diff type
                         clear_value: ClearValue {
                             color: ClearColor {
-                                float32: [0.0, 0.0, 0.0, 1.0],
+                                float32: [0.1, 0.25, 0.8, 1.0],
                             },
                         },
                     },
@@ -545,7 +589,46 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 .into_iter(),
                 SubpassContents::Inline,
             );
-            command_buffer.draw_indexed(0..INDICES.len() as u32, 0, 0..1);
+            command_buffer.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..1);
+            // render a second model, the floor
+            {
+                let model = Matrix4::<f32>::new_translation(&Vector3::new(0.0, 110.0, 0.0))
+                    * Matrix4::<f32>::from_euler_angles(std::f32::consts::PI / 2.0, 0.0, 0.0)
+                    * Matrix4::<f32>::new_scaling(200.0);
+
+                // TODO: create a global descriptor set with view and projection and one model specific set for every model each
+                let transformations = Transformations {
+                    model,
+                    view,
+                    projection,
+                };
+
+                Self::copy_into_memory(
+                    &self.device,
+                    &transformations as *const Transformations as *const u8,
+                    &mut self.floor_uniform_buffers_memory[frame_id],
+                    size_of::<Transformations>(),
+                );
+
+                command_buffer.bind_vertex_buffers(
+                    0,
+                    iter::once((&*self.floor_vertex_buffer, SubRange::WHOLE)),
+                );
+                command_buffer.bind_index_buffer(
+                    &*self.floor_index_buffer,
+                    SubRange::WHOLE,
+                    IndexType::U16,
+                );
+                command_buffer.bind_graphics_descriptor_sets(
+                    &self.pipeline_layout,
+                    0,
+                    iter::once(&self.floor_descriptor_sets[frame_id]),
+                    iter::empty(),
+                );
+
+                command_buffer.draw_indexed(0..QUAD_INDICES.len() as u32, 0, 0..1);
+            }
+
             command_buffer.end_render_pass();
             command_buffer.finish();
 
@@ -909,9 +992,10 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         command_pool: &mut B::CommandPool,
         limits: &gfx_hal::Limits,
         memory_types: &[MemoryType],
+        vertices: &[Vertex],
     ) -> (ManuallyDrop<B::Buffer>, ManuallyDrop<B::Memory>) {
         let buffer_stride = size_of::<Vertex>();
-        let buffer_len = VERTICES.len() * buffer_stride;
+        let buffer_len = vertices.len() * buffer_stride;
         // buffer needs to have size that's a multiple of non_coherent_atom_size for it to be mapped
         let padded_buffer_len = ((buffer_len + limits.non_coherent_atom_size - 1)
             / limits.non_coherent_atom_size
@@ -929,7 +1013,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         unsafe {
             Self::copy_into_memory(
                 device,
-                VERTICES.as_ptr() as *const u8,
+                vertices.as_ptr() as *const u8,
                 &mut staging_memory,
                 buffer_len,
             )
@@ -967,9 +1051,10 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         command_pool: &mut B::CommandPool,
         limits: &gfx_hal::Limits,
         memory_types: &[MemoryType],
+        indices: &[u16],
     ) -> (ManuallyDrop<B::Buffer>, ManuallyDrop<B::Memory>) {
         let buffer_stride = size_of::<u16>();
-        let buffer_len = INDICES.len() * buffer_stride;
+        let buffer_len = indices.len() * buffer_stride;
         let padded_buffer_len = ((buffer_len + limits.non_coherent_atom_size - 1)
             / limits.non_coherent_atom_size
             * limits.non_coherent_atom_size) as u64;
@@ -985,7 +1070,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         unsafe {
             Self::copy_into_memory(
                 device,
-                INDICES.as_ptr() as *const u8,
+                indices.as_ptr() as *const u8,
                 &mut staging_memory,
                 buffer_len,
             )
@@ -1081,10 +1166,12 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         device: &B::Device,
         frames_in_flight: usize,
     ) -> ManuallyDrop<B::DescriptorPool> {
+        // max_sets and count are only equal because every descriptor set contains one of each descriptor at the moment
+        // this can change in the future and does not have to be equal
         ManuallyDrop::new(
             unsafe {
                 device.create_descriptor_pool(
-                    frames_in_flight,
+                    frames_in_flight * 2, // total amount of sets we will allocate // todo: make nice
                     vec![
                         DescriptorRangeDesc {
                             ty: DescriptorType::Buffer {
@@ -1093,16 +1180,14 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                                     dynamic_offset: false,
                                 },
                             },
-                            count: frames_in_flight, // we need one descriptor for each frame in flight
+                            // how many descriptors of this type will exist (technically indepependent of max_sets)
+                            count: frames_in_flight * 2,
                         },
                         DescriptorRangeDesc {
                             ty: DescriptorType::Image {
                                 ty: ImageDescriptorType::Sampled { with_sampler: true },
                             },
-                            // todo: theoretically no dedicated descriptor is needed for every frame in flight
-                            // since this one doesn't change every frame, we could share it
-                            // https://software.intel.com/content/www/us/en/develop/articles/practical-approach-to-vulkan-part-1.html
-                            count: frames_in_flight,
+                            count: frames_in_flight * 2,
                         },
                     ]
                     .into_iter(),
@@ -1267,7 +1352,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             unsafe {
                 device.create_sampler(&SamplerDesc::new(
                     gfximg::Filter::Linear,
-                    gfximg::WrapMode::Clamp,
+                    gfximg::WrapMode::Tile,
                 ))
             }
             .unwrap(),
@@ -1487,6 +1572,14 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                 self.device
                     .destroy_buffer(ManuallyDrop::take(uniform_buffer));
             }
+            self.device
+                .destroy_buffer(ManuallyDrop::take(&mut self.floor_vertex_buffer));
+            self.device
+                .destroy_buffer(ManuallyDrop::take(&mut self.floor_index_buffer));
+            for floor_uniform_buffer in self.floor_uniform_buffers.iter_mut() {
+                self.device
+                    .destroy_buffer(ManuallyDrop::take(floor_uniform_buffer));
+            }
 
             self.device
                 .destroy_image(ManuallyDrop::take(&mut self.texture_image));
@@ -1500,6 +1593,14 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
             for uniform_buffer_memory in self.uniform_buffers_memory.iter_mut() {
                 self.device
                     .free_memory(ManuallyDrop::take(uniform_buffer_memory));
+            }
+            self.device
+                .free_memory(ManuallyDrop::take(&mut self.floor_vertex_buffer_memory));
+            self.device
+                .free_memory(ManuallyDrop::take(&mut self.floor_index_buffer_memory));
+            for floor_uniform_buffer_memory in self.floor_uniform_buffers_memory.iter_mut() {
+                self.device
+                    .free_memory(ManuallyDrop::take(floor_uniform_buffer_memory));
             }
             self.device
                 .free_memory(ManuallyDrop::take(&mut self.texture_memory));
@@ -1535,7 +1636,7 @@ const APPLICATION_NAME: &'static str = "Rust Game Engine";
 const DEFAULT_WINDOW_SIZE: [u32; 2] = [512, 512];
 
 #[cfg_attr(rustfmt, rustfmt_skip)]
-const VERTICES: [Vertex; 24] = [
+const CUBE_VERTICES: [Vertex; 24] = [
     Vertex { position: [-0.5, -0.5,  0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },    // front
     Vertex { position: [-0.5,  0.5,  0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
     Vertex { position: [ 0.5,  0.5,  0.5], color: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
@@ -1569,13 +1670,27 @@ const VERTICES: [Vertex; 24] = [
 
 // these indices must be counter-clockwise for backface culling to work
 #[cfg_attr(rustfmt, rustfmt_skip)]
-const INDICES: [u16; 36] = [
+const CUBE_INDICES: [u16; 36] = [
      0,  1,  2,  0,  2,  3, // front
      4,  5,  6,  4,  6,  7, // back
      8,  9, 10,  8, 10, 11, // left
     12, 13, 14, 12, 14, 15, // right
     16, 17, 18, 16, 18, 19, // top
     20, 21, 22, 20, 22, 23, // bottom
+];
+
+#[cfg_attr(rustfmt, rustfmt_skip)]
+const QUAD_VERTICES: [Vertex; 4] = [
+    Vertex { position: [-0.5, -0.5,  0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },
+    Vertex { position: [-0.5,  0.5,  0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 40.0] },
+    Vertex { position: [ 0.5,  0.5,  0.5], color: [0.0, 0.0, 1.0], uv: [40.0, 40.0] },
+    Vertex { position: [ 0.5, -0.5,  0.5], color: [1.0, 1.0, 1.0], uv: [40.0, 0.0] },
+];
+
+// these indices must be counter-clockwise for backface culling to work
+#[cfg_attr(rustfmt, rustfmt_skip)]
+const QUAD_INDICES: [u16; 6] = [
+     0,  1,  2,  0,  2,  3,
 ];
 
 fn main() {
