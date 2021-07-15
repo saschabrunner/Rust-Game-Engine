@@ -18,7 +18,7 @@ use gfx_hal::{
         BufferCopy, BufferImageCopy, ClearColor, ClearDepthStencil, ClearValue, CommandBuffer,
         CommandBufferFlags, Level, RenderAttachmentInfo, SubpassContents,
     },
-    device::Device,
+    device::Device as _,
     format::{Aspects, ChannelType, Format, ImageFeature, Swizzle},
     image::{
         self as gfximg, Extent, FramebufferAttachment, Layout, SamplerDesc, SubresourceLayers,
@@ -81,32 +81,91 @@ struct ViewProjectionTransform<B: gfx_hal::Backend> {
 }
 
 struct Buffer<B: gfx_hal::Backend> {
+    device: Rc<Device<B>>,
     buffer: ManuallyDrop<B::Buffer>,
-    memory: ManuallyDrop<B::Memory>,
+    memory: ManuallyDrop<B::Memory>, // this should be replaced by memory from an allocator
+}
+
+impl<B: gfx_hal::Backend> Buffer<B> {
+    fn create(
+        device: &Rc<Device<B>>,
+        buffer_len: u64,
+        usage: buffer::Usage,
+        properties: memory::Properties,
+    ) -> Buffer<B> {
+        let mut buffer = ManuallyDrop::new(
+            unsafe {
+                device
+                    .logical_device
+                    .create_buffer(buffer_len, usage, SparseFlags::empty())
+            }
+            .unwrap(),
+        );
+
+        let buffer_requirements = unsafe { device.logical_device.get_buffer_requirements(&buffer) };
+
+        let buffer_memory_type = device.find_memory_type(buffer_requirements.type_mask, properties);
+
+        let memory = unsafe {
+            let memory = device
+                .logical_device
+                .allocate_memory(buffer_memory_type, buffer_requirements.size)
+                .unwrap();
+            device
+                .logical_device
+                .bind_buffer_memory(&memory, 0, &mut buffer)
+                .unwrap();
+            ManuallyDrop::new(memory)
+        };
+
+        Buffer {
+            device: device.clone(),
+            buffer,
+            memory,
+        }
+    }
+}
+
+impl<B: gfx_hal::Backend> Drop for Buffer<B> {
+    fn drop(&mut self) {
+        // wait for device to become idle
+        self.device.logical_device.wait_idle().unwrap();
+
+        unsafe {
+            self.device
+                .logical_device
+                .destroy_buffer(ManuallyDrop::take(&mut self.buffer));
+            self.device
+                .logical_device
+                .free_memory(ManuallyDrop::take(&mut self.memory));
+        }
+    }
 }
 
 struct Image<B: gfx_hal::Backend> {
-    device: Rc<B::Device>,
+    device: Rc<Device<B>>,
     image: ManuallyDrop<B::Image>,
-    memory: ManuallyDrop<B::Memory>,
+    memory: ManuallyDrop<B::Memory>, // this should be replaced by memory from an allocator
 }
 
 impl<B: gfx_hal::Backend> Drop for Image<B> {
     fn drop(&mut self) {
         // wait for device to become idle
-        self.device.wait_idle().unwrap();
+        self.device.logical_device.wait_idle().unwrap();
 
         unsafe {
             self.device
+                .logical_device
                 .destroy_image(ManuallyDrop::take(&mut self.image));
             self.device
+                .logical_device
                 .free_memory(ManuallyDrop::take(&mut self.memory));
         }
     }
 }
 
 struct Texture<B: gfx_hal::Backend> {
-    device: Rc<B::Device>,
+    device: Rc<Device<B>>,
     image: Image<B>,
     image_view: ManuallyDrop<B::ImageView>,
     sampler: ManuallyDrop<B::Sampler>, // TODO: make this sharable between textures
@@ -115,12 +174,14 @@ struct Texture<B: gfx_hal::Backend> {
 impl<B: gfx_hal::Backend> Drop for Texture<B> {
     fn drop(&mut self) {
         // wait for device to become idle
-        self.device.wait_idle().unwrap();
+        self.device.logical_device.wait_idle().unwrap();
 
         unsafe {
             self.device
+                .logical_device
                 .destroy_image_view(ManuallyDrop::take(&mut self.image_view));
             self.device
+                .logical_device
                 .destroy_sampler(ManuallyDrop::take(&mut self.sampler));
             // drop of image will be called here
         }
@@ -147,6 +208,34 @@ struct FrameData<B: gfx_hal::Backend> {
     command_buffer: B::CommandBuffer,
 }
 
+struct Device<B: gfx_hal::Backend> {
+    logical_device: B::Device,
+    limits: gfx_hal::Limits,
+    // in the future I might also want to consider the memory_heaps field in the memory properties
+    // this will be useful to determine wheter the type belongs to the GPUs VRAM or might be slow system RAM
+    memory_types: Vec<gfx_hal::adapter::MemoryType>,
+}
+
+impl<B: gfx_hal::Backend> Device<B> {
+    fn find_memory_type(
+        &self,
+        requirements_type_mask: u32,
+        required_properties: memory::Properties,
+    ) -> MemoryTypeId {
+        self.memory_types
+            .iter()
+            .enumerate()
+            .position(|(id, memory_type)| {
+                // shift one bit and use bitwise and to find the first memory type that
+                // is usable and has the required properties
+                requirements_type_mask & (1 << id) != 0
+                    && memory_type.properties.contains(required_properties)
+            })
+            .unwrap()
+            .into()
+    }
+}
+
 struct Renderer<B: gfx_hal::Backend> {
     camera: Camera,
     surface: ManuallyDrop<B::Surface>,
@@ -166,21 +255,27 @@ struct Renderer<B: gfx_hal::Backend> {
     //texture_image_view: ManuallyDrop<B::ImageView>,
     depth_image_view: ManuallyDrop<B::ImageView>,
     //texture_sampler: ManuallyDrop<B::Sampler>,
-    vertex_buffer: ManuallyDrop<B::Buffer>,
-    index_buffer: ManuallyDrop<B::Buffer>,
-    uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
-    floor_vertex_buffer: ManuallyDrop<B::Buffer>,
-    floor_index_buffer: ManuallyDrop<B::Buffer>,
-    floor_uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
+    vertex_buffer: ManuallyDrop<Buffer<B>>,
+    index_buffer: ManuallyDrop<Buffer<B>>,
+    uniform_buffers: Vec<ManuallyDrop<Buffer<B>>>,
+    floor_vertex_buffer: ManuallyDrop<Buffer<B>>,
+    floor_index_buffer: ManuallyDrop<Buffer<B>>,
+    floor_uniform_buffers: Vec<ManuallyDrop<Buffer<B>>>,
+    //vertex_buffer: ManuallyDrop<B::Buffer>,
+    //index_buffer: ManuallyDrop<B::Buffer>,
+    //uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
+    //floor_vertex_buffer: ManuallyDrop<B::Buffer>,
+    //floor_index_buffer: ManuallyDrop<B::Buffer>,
+    //floor_uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
     //texture_image: ManuallyDrop<B::Image>,
     texture: ManuallyDrop<Texture<B>>, // ManuallyDrop because we need to drop this earlier than others
     depth_image: ManuallyDrop<B::Image>, //todo: per frame in flight
-    vertex_buffer_memory: ManuallyDrop<B::Memory>,
-    index_buffer_memory: ManuallyDrop<B::Memory>,
-    uniform_buffers_memory: Vec<ManuallyDrop<B::Memory>>,
-    floor_vertex_buffer_memory: ManuallyDrop<B::Memory>,
-    floor_index_buffer_memory: ManuallyDrop<B::Memory>,
-    floor_uniform_buffers_memory: Vec<ManuallyDrop<B::Memory>>,
+    //vertex_buffer_memory: ManuallyDrop<B::Memory>,
+    //index_buffer_memory: ManuallyDrop<B::Memory>,
+    //uniform_buffers_memory: Vec<ManuallyDrop<B::Memory>>,
+    //floor_vertex_buffer_memory: ManuallyDrop<B::Memory>,
+    //floor_index_buffer_memory: ManuallyDrop<B::Memory>,
+    //floor_uniform_buffers_memory: Vec<ManuallyDrop<B::Memory>>,
     //texture_memory: ManuallyDrop<B::Memory>,
     depth_image_memory: ManuallyDrop<B::Memory>,
     descriptor_set_layout: ManuallyDrop<B::DescriptorSetLayout>,
@@ -191,11 +286,11 @@ struct Renderer<B: gfx_hal::Backend> {
     frame: u64,
     start_time: Instant,
     // these are dropped in the order they are declared, very important!
-    // currently assuming that during drop, this struct is the only one with a ref to device!
+    // currently assuming that during drop, this is the only Rc to this device!
     // every other struct that has a handle on this device should have been dropped at this point already
-    // alternatively, a function could be created to get a more short lived reference to the device
+    // alternatively, a global function could be created to get a more short lived reference to the device
     // then Rc wouldn't be needed at all
-    device: Rc<B::Device>,
+    device: Rc<Device<B>>,
     adapter: Adapter<B>,
     queue_group: QueueGroup<B>,
     instance: B::Instance,
@@ -204,10 +299,6 @@ struct Renderer<B: gfx_hal::Backend> {
 impl<B: gfx_hal::Backend> Renderer<B> {
     pub fn new(instance: B::Instance, mut surface: B::Surface, adapter: Adapter<B>) -> Renderer<B> {
         let physical_device = &adapter.physical_device;
-        let limits = physical_device.properties().limits;
-        let memory_types = physical_device.memory_properties().memory_types;
-        // in the future I might also want to consider the memory_heaps field in the memory properties
-        // this will be useful to determine wheter the type belongs to the GPUs VRAM or might be slow system RAM
 
         let queue_family = Self::find_queue_family(&adapter, &surface);
 
@@ -217,7 +308,11 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 .expect("Failed to open device")
         };
 
-        let device = Rc::new(gpu.device);
+        let device = Rc::new(Device::<B> {
+            logical_device: gpu.device,
+            limits: physical_device.properties().limits,
+            memory_types: physical_device.memory_properties().memory_types,
+        });
         let mut queue_group = gpu.queue_groups.pop().unwrap();
 
         // limit amount of frames calculated simultaneously to avoid the CPU outrunning the GPU
@@ -232,6 +327,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             unsafe {
                 // a command pool allocates command buffers and is supposed to be used from a single thread only
                 let mut command_pool = device
+                    .logical_device
                     .create_command_pool(queue_group.family, CommandPoolCreateFlags::empty())
                     .expect("Out of memory creating command pool");
 
@@ -239,11 +335,13 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 command_pools.push(command_pool);
                 submission_complete_semaphores.push(
                     device
+                        .logical_device
                         .create_semaphore()
                         .expect("Out of memory creating semaphore"),
                 );
                 submission_complete_fences.push(
                     device
+                        .logical_device
                         .create_fence(true)
                         .expect("Out of memory creating fence"),
                 );
@@ -277,7 +375,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         unsafe {
             surface
-                .configure_swapchain(&device, swapchain_config)
+                .configure_swapchain(&device.logical_device, swapchain_config)
                 .expect("Failed to configure swapchain");
         }
 
@@ -289,37 +387,14 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         )
         .unwrap()
         .to_rgba8();
-        // let (texture_image, texture_memory) = Self::create_texture_image(
-        //     &device,
-        //     &mut queue_group,
-        //     &mut command_pools[0],
-        //     &limits,
-        //     &memory_types,
-        //     &image,
-        // );
 
-        // let texture_image_view = Self::create_image_view(
-        //     &device,
-        //     &texture_image,
-        //     Format::Rgba8Srgb,
-        //     Aspects::COLOR,
-        //     gfximg::Usage::SAMPLED,
-        // );
-        // let texture_sampler = Self::create_texture_sampler(&device);
+        let texture =
+            Self::create_texture(&device, &mut queue_group, &mut command_pools[0], &image);
 
-        let texture = Self::create_texture(
-            &device,
-            &mut queue_group,
-            &mut command_pools[0],
-            &limits,
-            &memory_types,
-            &image,
-        );
-
-        let descriptor_set_layout = Self::create_descriptor_set_layout(&device);
-        let (uniform_buffers, uniform_buffers_memory) =
-            Self::create_uniform_buffers(&device, &limits, &memory_types, frames_in_flight);
-        let mut descriptor_pool = Self::create_descriptor_pool(&device, frames_in_flight);
+        let descriptor_set_layout = Self::create_descriptor_set_layout(&device.logical_device);
+        let uniform_buffers = Self::create_uniform_buffers(&device, frames_in_flight); // todo
+        let mut descriptor_pool =
+            Self::create_descriptor_pool(&device.logical_device, frames_in_flight);
         let descriptor_sets = Self::create_descriptor_sets(
             &device,
             &descriptor_set_layout,
@@ -332,7 +407,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         let (depth_image, depth_image_memory) = Self::create_image(
             &device,
-            &memory_types,
             surface_extent.width,
             surface_extent.height,
             depth_format,
@@ -342,51 +416,43 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         );
 
         let depth_image_view = Self::create_image_view(
-            &device,
+            &device.logical_device, // todo
             &depth_image,
             depth_format,
             Aspects::DEPTH, // todo: stencil aspect
             gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
         );
 
-        let render_pass = Self::create_render_pass(&device, surface_format, depth_format);
+        let render_pass =
+            Self::create_render_pass(&device.logical_device, surface_format, depth_format); // todo
 
-        let (vertex_buffer, vertex_buffer_memory) = Self::create_vertex_buffer(
+        let vertex_buffer = Self::create_vertex_buffer(
             &device,
             &mut queue_group,
             &mut command_pools[0],
-            &limits,
-            &memory_types,
             &CUBE_VERTICES,
         );
 
-        let (index_buffer, index_buffer_memory) = Self::create_index_buffer(
+        let index_buffer = Self::create_index_buffer(
             &device,
             &mut queue_group,
             &mut command_pools[0],
-            &limits,
-            &memory_types,
             &CUBE_INDICES,
         );
 
-        let (floor_vertex_buffer, floor_vertex_buffer_memory) = Self::create_vertex_buffer(
+        let floor_vertex_buffer = Self::create_vertex_buffer(
             &device,
             &mut queue_group,
             &mut command_pools[0],
-            &limits,
-            &memory_types,
             &QUAD_VERTICES,
         );
-        let (floor_index_buffer, floor_index_buffer_memory) = Self::create_index_buffer(
+        let floor_index_buffer = Self::create_index_buffer(
             &device,
             &mut queue_group,
             &mut command_pools[0],
-            &limits,
-            &memory_types,
             &QUAD_INDICES,
         );
-        let (floor_uniform_buffers, floor_uniform_buffers_memory) =
-            Self::create_uniform_buffers(&device, &limits, &memory_types, frames_in_flight);
+        let floor_uniform_buffers = Self::create_uniform_buffers(&device, frames_in_flight);
         let floor_descriptor_sets = Self::create_descriptor_sets(
             &device,
             &descriptor_set_layout,
@@ -399,6 +465,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         let pipeline_layout = ManuallyDrop::new(unsafe {
             device
+                .logical_device
                 .create_pipeline_layout(iter::once(&*descriptor_set_layout), iter::empty())
                 .expect("Out of memory creating pipeline layout")
         });
@@ -415,7 +482,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         let pipeline = unsafe {
             Self::make_pipeline(
-                &device,
+                &device.logical_device, // todo
                 &render_pass,
                 &*pipeline_layout,
                 &vertex_shader,
@@ -435,6 +502,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         };
         let framebuffer = ManuallyDrop::new(unsafe {
             device
+                .logical_device
                 .create_framebuffer(
                     &render_pass,
                     vec![framebuffer_attachment, depth_attachment].into_iter(),
@@ -482,12 +550,10 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             floor_uniform_buffers,
             //texture_image,
             depth_image,
-            vertex_buffer_memory,
-            index_buffer_memory,
-            uniform_buffers_memory,
-            floor_vertex_buffer_memory,
-            floor_index_buffer_memory,
-            floor_uniform_buffers_memory,
+            //index_buffer_memory,
+            //uniform_buffers_memory,
+            //floor_index_buffer_memory,
+            //floor_uniform_buffers_memory,
             //texture_memory,
             depth_image_memory,
             descriptor_set_layout,
@@ -516,16 +582,20 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         self.viewport.rect.h = self.surface_extent.height as i16;
 
         unsafe {
-            self.device.wait_idle().unwrap();
+            self.device.logical_device.wait_idle().unwrap();
 
             // destroy resources about to be recreated
             self.device
+                .logical_device
                 .destroy_framebuffer(ManuallyDrop::take(&mut self.framebuffer));
             self.device
+                .logical_device
                 .destroy_image_view(ManuallyDrop::take(&mut self.depth_image_view));
             self.device
+                .logical_device
                 .destroy_image(ManuallyDrop::take(&mut self.depth_image));
             self.device
+                .logical_device
                 .free_memory(ManuallyDrop::take(&mut self.depth_image_memory));
 
             let depth_attachment = FramebufferAttachment {
@@ -537,6 +607,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             // recreate framebuffer
             self.framebuffer = ManuallyDrop::new(
                 self.device
+                    .logical_device
                     .create_framebuffer(
                         &self.render_pass,
                         vec![swapchain_config.framebuffer_attachment(), depth_attachment]
@@ -548,18 +619,13 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
             // reconfigure swapchain
             self.surface
-                .configure_swapchain(&self.device, swapchain_config)
+                .configure_swapchain(&self.device.logical_device, swapchain_config)
                 .expect("Failed to configure swapchain");
         }
 
         // recreate depth buffer
         let (depth_image, depth_image_memory) = Self::create_image(
             &self.device,
-            &self
-                .adapter
-                .physical_device
-                .memory_properties()
-                .memory_types,
             self.surface_extent.width,
             self.surface_extent.height,
             self.depth_format,
@@ -569,7 +635,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         );
 
         let depth_image_view = Self::create_image_view(
-            &self.device,
+            &self.device.logical_device,
             &depth_image,
             self.depth_format,
             Aspects::DEPTH, // todo: stencil aspect
@@ -589,12 +655,14 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             // wait for the previous submission to finish before resetting command pool and preparing new frame
             let render_timeout_ns = 1_000_000_000;
             self.device
+                .logical_device
                 .wait_for_fence(
                     &self.submission_complete_fences[frame_id],
                     render_timeout_ns,
                 )
                 .expect("Out of memory or device lost waiting for fence");
             self.device
+                .logical_device
                 .reset_fence(&mut self.submission_complete_fences[frame_id])
                 .expect("Out of memory resetting fence");
             self.command_pools[frame_id].reset(false);
@@ -631,9 +699,9 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         // copy data into uniform buffer
         unsafe {
             Self::copy_into_memory(
-                &self.device,
+                &self.device.logical_device,
                 &transformations as *const Transformations as *const u8,
-                &mut self.uniform_buffers_memory[frame_id],
+                &mut self.uniform_buffers[frame_id].memory,
                 size_of::<Transformations>(),
             )
         };
@@ -646,9 +714,15 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             command_buffer.set_scissors(0, iter::once(self.viewport.rect));
 
             command_buffer.bind_graphics_pipeline(&self.pipeline);
-            command_buffer
-                .bind_vertex_buffers(0, iter::once((&*self.vertex_buffer, SubRange::WHOLE)));
-            command_buffer.bind_index_buffer(&*self.index_buffer, SubRange::WHOLE, IndexType::U16);
+            command_buffer.bind_vertex_buffers(
+                0,
+                iter::once((&*self.vertex_buffer.buffer, SubRange::WHOLE)),
+            );
+            command_buffer.bind_index_buffer(
+                &*self.index_buffer.buffer,
+                SubRange::WHOLE,
+                IndexType::U16,
+            );
             command_buffer.bind_graphics_descriptor_sets(
                 &self.pipeline_layout,
                 0,
@@ -698,18 +772,18 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 };
 
                 Self::copy_into_memory(
-                    &self.device,
+                    &self.device.logical_device,
                     &transformations as *const Transformations as *const u8,
-                    &mut self.floor_uniform_buffers_memory[frame_id],
+                    &mut self.floor_uniform_buffers[frame_id].memory,
                     size_of::<Transformations>(),
                 );
 
                 command_buffer.bind_vertex_buffers(
                     0,
-                    iter::once((&*self.floor_vertex_buffer, SubRange::WHOLE)),
+                    iter::once((&*self.floor_vertex_buffer.buffer, SubRange::WHOLE)),
                 );
                 command_buffer.bind_index_buffer(
-                    &*self.floor_index_buffer,
+                    &*self.floor_index_buffer.buffer,
                     SubRange::WHOLE,
                     IndexType::U16,
                 );
@@ -839,8 +913,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     }
 
     fn create_image(
-        device: &B::Device,
-        memory_types: &[MemoryType],
+        device: &Rc<Device<B>>,
         width: u32,
         height: u32,
         format: Format,
@@ -848,9 +921,10 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         usage: gfximg::Usage,
         properties: memory::Properties,
     ) -> (ManuallyDrop<B::Image>, ManuallyDrop<B::Memory>) {
+        // TODO: return Image
         let mut image = ManuallyDrop::new(
             unsafe {
-                device.create_image(
+                device.logical_device.create_image(
                     gfximg::Kind::D2(width, height, 1, 1),
                     1,
                     format,
@@ -863,14 +937,17 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             .unwrap(),
         );
 
-        let image_requirements = unsafe { device.get_image_requirements(&image) };
-        let memory_type =
-            Self::find_memory_type(&memory_types, image_requirements.type_mask, properties);
+        let image_requirements = unsafe { device.logical_device.get_image_requirements(&image) };
+        let memory_type = device.find_memory_type(image_requirements.type_mask, properties);
         let memory = unsafe {
             let memory = device
+                .logical_device
                 .allocate_memory(memory_type, image_requirements.size)
                 .unwrap();
-            device.bind_image_memory(&memory, 0, &mut image).unwrap();
+            device
+                .logical_device
+                .bind_image_memory(&memory, 0, &mut image)
+                .unwrap();
             ManuallyDrop::new(memory)
         };
 
@@ -1081,23 +1158,20 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     }
 
     fn create_vertex_buffer(
-        device: &B::Device,
+        device: &Rc<Device<B>>,
         queue_group: &mut QueueGroup<B>,
         command_pool: &mut B::CommandPool,
-        limits: &gfx_hal::Limits,
-        memory_types: &[MemoryType],
         vertices: &[Vertex],
-    ) -> (ManuallyDrop<B::Buffer>, ManuallyDrop<B::Memory>) {
+    ) -> ManuallyDrop<Buffer<B>> {
         let buffer_stride = size_of::<Vertex>();
         let buffer_len = vertices.len() * buffer_stride;
         // buffer needs to have size that's a multiple of non_coherent_atom_size for it to be mapped
-        let padded_buffer_len = ((buffer_len + limits.non_coherent_atom_size - 1)
-            / limits.non_coherent_atom_size
-            * limits.non_coherent_atom_size) as u64;
+        let padded_buffer_len = ((buffer_len + device.limits.non_coherent_atom_size - 1)
+            / device.limits.non_coherent_atom_size
+            * device.limits.non_coherent_atom_size) as u64;
 
-        let (staging_buffer, mut staging_memory) = Self::create_buffer(
+        let mut staging_buffer = Buffer::create(
             device,
-            memory_types,
             padded_buffer_len,
             buffer::Usage::TRANSFER_SRC,
             memory::Properties::CPU_VISIBLE,
@@ -1106,16 +1180,15 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         // copy data into staging buffer
         unsafe {
             Self::copy_into_memory(
-                device,
+                &device.logical_device,
                 vertices.as_ptr() as *const u8,
-                &mut staging_memory,
+                &mut staging_buffer.memory,
                 buffer_len,
             )
         };
 
-        let (buffer, memory) = Self::create_buffer(
+        let buffer = Buffer::create(
             device,
-            memory_types,
             buffer_len as u64,
             buffer::Usage::TRANSFER_DST | buffer::Usage::VERTEX,
             memory::Properties::DEVICE_LOCAL,
@@ -1123,39 +1196,31 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // copy staging buffer into final buffer
         Self::copy_buffer(
-            device,
+            &device.logical_device,
             queue_group,
-            &staging_buffer,
-            &buffer,
+            &staging_buffer.buffer,
+            &buffer.buffer,
             command_pool,
             buffer_len as u64,
         );
 
-        unsafe {
-            device.destroy_buffer(ManuallyDrop::into_inner(staging_buffer));
-            device.free_memory(ManuallyDrop::into_inner(staging_memory));
-        }
-
-        (buffer, memory)
+        ManuallyDrop::new(buffer)
     }
 
     fn create_index_buffer(
-        device: &B::Device,
+        device: &Rc<Device<B>>,
         queue_group: &mut QueueGroup<B>,
         command_pool: &mut B::CommandPool,
-        limits: &gfx_hal::Limits,
-        memory_types: &[MemoryType],
         indices: &[u16],
-    ) -> (ManuallyDrop<B::Buffer>, ManuallyDrop<B::Memory>) {
+    ) -> ManuallyDrop<Buffer<B>> {
         let buffer_stride = size_of::<u16>();
         let buffer_len = indices.len() * buffer_stride;
-        let padded_buffer_len = ((buffer_len + limits.non_coherent_atom_size - 1)
-            / limits.non_coherent_atom_size
-            * limits.non_coherent_atom_size) as u64;
+        let padded_buffer_len = ((buffer_len + device.limits.non_coherent_atom_size - 1)
+            / device.limits.non_coherent_atom_size
+            * device.limits.non_coherent_atom_size) as u64;
 
-        let (staging_buffer, mut staging_memory) = Self::create_buffer(
+        let mut staging_buffer = Buffer::create(
             device,
-            memory_types,
             padded_buffer_len,
             buffer::Usage::TRANSFER_SRC,
             memory::Properties::CPU_VISIBLE,
@@ -1163,36 +1228,30 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         unsafe {
             Self::copy_into_memory(
-                device,
+                &device.logical_device,
                 indices.as_ptr() as *const u8,
-                &mut staging_memory,
+                &mut staging_buffer.memory,
                 buffer_len,
             )
         };
 
-        let (buffer, memory) = Self::create_buffer(
+        let buffer = Buffer::create(
             device,
-            memory_types,
             buffer_len as u64,
             buffer::Usage::TRANSFER_DST | buffer::Usage::INDEX,
             memory::Properties::DEVICE_LOCAL,
         );
 
         Self::copy_buffer(
-            device,
+            &device.logical_device,
             queue_group,
-            &staging_buffer,
-            &buffer,
+            &staging_buffer.buffer,
+            &buffer.buffer,
             command_pool,
             buffer_len as u64,
         );
 
-        unsafe {
-            device.destroy_buffer(ManuallyDrop::into_inner(staging_buffer));
-            device.free_memory(ManuallyDrop::into_inner(staging_memory));
-        }
-
-        (buffer, memory)
+        ManuallyDrop::new(buffer)
     }
 
     fn create_descriptor_set_layout(device: &B::Device) -> ManuallyDrop<B::DescriptorSetLayout> {
@@ -1231,29 +1290,25 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     }
 
     fn create_uniform_buffers(
-        device: &B::Device,
-        limits: &gfx_hal::Limits,
-        memory_types: &[MemoryType],
+        device: &Rc<Device<B>>,
         frames_in_flight: usize,
-    ) -> (Vec<ManuallyDrop<B::Buffer>>, Vec<ManuallyDrop<B::Memory>>) {
+    ) -> Vec<ManuallyDrop<Buffer<B>>> {
         let mut uniform_buffers = Vec::with_capacity(frames_in_flight);
-        let mut uniform_buffers_memory = Vec::with_capacity(frames_in_flight);
-        let padded_length = ((size_of::<Transformations>() + limits.non_coherent_atom_size - 1)
-            / limits.non_coherent_atom_size
-            * limits.non_coherent_atom_size) as u64;
+        let padded_length = ((size_of::<Transformations>() + device.limits.non_coherent_atom_size
+            - 1)
+            / device.limits.non_coherent_atom_size
+            * device.limits.non_coherent_atom_size) as u64;
         for _ in 0..frames_in_flight {
-            let (uniform_buffer, uniform_buffer_memory) = Self::create_buffer(
-                &device,
-                &memory_types,
+            let uniform_buffer = Buffer::create(
+                device,
                 padded_length,
                 buffer::Usage::UNIFORM,
                 memory::Properties::CPU_VISIBLE,
             );
-            uniform_buffers.push(uniform_buffer);
-            uniform_buffers_memory.push(uniform_buffer_memory);
+            uniform_buffers.push(ManuallyDrop::new(uniform_buffer));
         }
 
-        (uniform_buffers, uniform_buffers_memory)
+        uniform_buffers
     }
 
     fn create_descriptor_pool(
@@ -1293,10 +1348,10 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     }
 
     fn create_descriptor_sets(
-        device: &B::Device,
+        device: &Rc<Device<B>>,
         descriptor_set_layout: &B::DescriptorSetLayout,
         descriptor_pool: &mut B::DescriptorPool,
-        uniform_buffers: &Vec<ManuallyDrop<B::Buffer>>,
+        uniform_buffers: &[ManuallyDrop<Buffer<B>>],
         image_view: &B::ImageView,
         sampler: &B::Sampler,
         frames_in_flight: usize,
@@ -1311,123 +1366,42 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         for i in 0..frames_in_flight {
             unsafe {
-                device.write_descriptor_set(DescriptorSetWrite {
-                    set: &mut descriptor_sets[i],
-                    binding: 0,
-                    array_offset: 0,
-                    descriptors: vec![
-                        Descriptor::Buffer(&*uniform_buffers[i], SubRange::WHOLE),
-                        // instead of a combined image sampler, we could also use a separate image and a sampler descriptor
-                        Descriptor::CombinedImageSampler(
-                            image_view,
-                            Layout::ShaderReadOnlyOptimal,
-                            sampler,
-                        ),
-                    ]
-                    .into_iter(),
-                })
+                device
+                    .logical_device
+                    .write_descriptor_set(DescriptorSetWrite {
+                        set: &mut descriptor_sets[i],
+                        binding: 0,
+                        array_offset: 0,
+                        descriptors: vec![
+                            Descriptor::Buffer(&*uniform_buffers[i].buffer, SubRange::WHOLE),
+                            // instead of a combined image sampler, we could also use a separate image and a sampler descriptor
+                            Descriptor::CombinedImageSampler(
+                                image_view,
+                                Layout::ShaderReadOnlyOptimal,
+                                sampler,
+                            ),
+                        ]
+                        .into_iter(),
+                    })
             }
         }
 
         descriptor_sets
     }
 
-    // fn create_texture_image(
-    //     device: &B::Device,
-    //     queue_group: &mut QueueGroup<B>,
-    //     command_pool: &mut B::CommandPool,
-    //     limits: &gfx_hal::Limits,
-    //     memory_types: &[MemoryType],
-    //     raw_image: &image::RgbaImage,
-    // ) -> (ManuallyDrop<B::Image>, ManuallyDrop<B::Memory>) {
-    //     let buffer_len = raw_image.width() * raw_image.height() * 4;
-    //     let padded_buffer_len = ((buffer_len as usize + limits.non_coherent_atom_size - 1)
-    //         / limits.non_coherent_atom_size
-    //         * limits.non_coherent_atom_size) as u64;
-
-    //     let (staging_buffer, mut staging_memory) = Self::create_buffer(
-    //         &device,
-    //         &memory_types,
-    //         padded_buffer_len,
-    //         buffer::Usage::TRANSFER_SRC,
-    //         memory::Properties::CPU_VISIBLE,
-    //     );
-
-    //     unsafe {
-    //         Self::copy_into_memory(
-    //             &device,
-    //             raw_image.as_ptr(),
-    //             &mut staging_memory,
-    //             buffer_len as usize,
-    //         )
-    //     };
-
-    //     let (texture_image, texture_memory) = Self::create_image(
-    //         &device,
-    //         &memory_types,
-    //         raw_image.width(),
-    //         raw_image.height(),
-    //         Format::Rgba8Srgb,
-    //         gfximg::Tiling::Optimal,
-    //         gfximg::Usage::TRANSFER_DST | gfximg::Usage::SAMPLED,
-    //         memory::Properties::DEVICE_LOCAL,
-    //     );
-
-    //     // transition to transfer destination layout
-    //     Self::transition_image_layout(
-    //         &device,
-    //         queue_group,
-    //         command_pool,
-    //         &texture_image,
-    //         Format::Rgba8Srgb,
-    //         Layout::Undefined..Layout::TransferDstOptimal,
-    //     );
-
-    //     // copy buffer to image
-    //     Self::copy_buffer_to_image(
-    //         &device,
-    //         queue_group,
-    //         &staging_buffer,
-    //         &texture_image,
-    //         command_pool,
-    //         raw_image.width(),
-    //         raw_image.height(),
-    //     );
-
-    //     // transition image to shader read layout
-    //     Self::transition_image_layout(
-    //         &device,
-    //         queue_group,
-    //         command_pool,
-    //         &texture_image,
-    //         Format::Rgba8Srgb,
-    //         Layout::TransferDstOptimal..Layout::ShaderReadOnlyOptimal,
-    //     );
-
-    //     unsafe {
-    //         device.destroy_buffer(ManuallyDrop::into_inner(staging_buffer));
-    //         device.free_memory(ManuallyDrop::into_inner(staging_memory));
-    //     }
-
-    //     (texture_image, texture_memory)
-    // }
-
     fn create_texture(
-        device: &Rc<B::Device>,
+        device: &Rc<Device<B>>,
         queue_group: &mut QueueGroup<B>,
         command_pool: &mut B::CommandPool,
-        limits: &gfx_hal::Limits,
-        memory_types: &[MemoryType],
         raw_image: &image::RgbaImage,
     ) -> ManuallyDrop<Texture<B>> {
         let buffer_len = raw_image.width() * raw_image.height() * 4;
-        let padded_buffer_len = ((buffer_len as usize + limits.non_coherent_atom_size - 1)
-            / limits.non_coherent_atom_size
-            * limits.non_coherent_atom_size) as u64;
+        let padded_buffer_len = ((buffer_len as usize + device.limits.non_coherent_atom_size - 1)
+            / device.limits.non_coherent_atom_size
+            * device.limits.non_coherent_atom_size) as u64;
 
-        let (staging_buffer, mut staging_memory) = Self::create_buffer(
-            &device,
-            &memory_types,
+        let mut staging_buffer = Buffer::create(
+            device,
             padded_buffer_len,
             buffer::Usage::TRANSFER_SRC,
             memory::Properties::CPU_VISIBLE,
@@ -1435,9 +1409,9 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         unsafe {
             Self::copy_into_memory(
-                &device,
+                &device.logical_device, // todo
                 raw_image.as_ptr(),
-                &mut staging_memory,
+                &mut staging_buffer.memory,
                 buffer_len as usize,
             )
         };
@@ -1445,7 +1419,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         // todo: refactor create_image to return Image<B>
         let (texture_image, texture_memory) = Self::create_image(
             &device,
-            &memory_types,
             raw_image.width(),
             raw_image.height(),
             Format::Rgba8Srgb,
@@ -1456,7 +1429,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // transition to transfer destination layout
         Self::transition_image_layout(
-            &device,
+            &device.logical_device,
             queue_group,
             command_pool,
             &texture_image,
@@ -1466,9 +1439,9 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // copy buffer to image
         Self::copy_buffer_to_image(
-            &device,
+            &device.logical_device,
             queue_group,
-            &staging_buffer,
+            &staging_buffer.buffer,
             &texture_image,
             command_pool,
             raw_image.width(),
@@ -1477,7 +1450,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // transition image to shader read layout
         Self::transition_image_layout(
-            &device,
+            &device.logical_device,
             queue_group,
             command_pool,
             &texture_image,
@@ -1485,19 +1458,14 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             Layout::TransferDstOptimal..Layout::ShaderReadOnlyOptimal,
         );
 
-        unsafe {
-            device.destroy_buffer(ManuallyDrop::into_inner(staging_buffer));
-            device.free_memory(ManuallyDrop::into_inner(staging_memory));
-        }
-
         let texture_image_view = Self::create_image_view(
-            &device,
+            &device.logical_device,
             &texture_image,
             Format::Rgba8Srgb,
             Aspects::COLOR,
             gfximg::Usage::SAMPLED,
         );
-        let texture_sampler = Self::create_texture_sampler(&device);
+        let texture_sampler = Self::create_texture_sampler(&device.logical_device);
 
         ManuallyDrop::new(Texture {
             device: device.clone(),
@@ -1732,81 +1700,74 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 impl<B: gfx_hal::Backend> Drop for Renderer<B> {
     fn drop(&mut self) {
         // wait for device to become idle
-        self.device.wait_idle().unwrap();
+        self.device.logical_device.wait_idle().unwrap();
 
         unsafe {
             // "drain" the vector, so that each value is dropped as we're iterating over it.
             // we need to drop the values before we destroy further elements of the renderer
             for command_pool in self.command_pools.drain(..) {
-                self.device.destroy_command_pool(command_pool);
+                self.device
+                    .logical_device
+                    .destroy_command_pool(command_pool);
             }
 
             for submission_complete_semaphore in self.submission_complete_semaphores.drain(..) {
-                self.device.destroy_semaphore(submission_complete_semaphore);
+                self.device
+                    .logical_device
+                    .destroy_semaphore(submission_complete_semaphore);
             }
 
             for submission_complete_fence in self.submission_complete_fences.drain(..) {
-                self.device.destroy_fence(submission_complete_fence);
+                self.device
+                    .logical_device
+                    .destroy_fence(submission_complete_fence);
             }
 
-            // drop texture and all its images/memory
+            // drop textures and buffers
             ManuallyDrop::drop(&mut self.texture);
+            ManuallyDrop::drop(&mut self.vertex_buffer);
+            ManuallyDrop::drop(&mut self.floor_vertex_buffer);
+            ManuallyDrop::drop(&mut self.index_buffer);
+            ManuallyDrop::drop(&mut self.floor_index_buffer);
+            for uniform_buffer in self.uniform_buffers.iter_mut() {
+                ManuallyDrop::drop(uniform_buffer);
+            }
+            for floor_uniform_buffer in self.floor_uniform_buffers.iter_mut() {
+                ManuallyDrop::drop(floor_uniform_buffer);
+            }
 
             self.device
+                .logical_device
                 .destroy_image_view(ManuallyDrop::take(&mut self.depth_image_view));
 
             self.device
-                .destroy_buffer(ManuallyDrop::take(&mut self.vertex_buffer));
-            self.device
-                .destroy_buffer(ManuallyDrop::take(&mut self.index_buffer));
-            for uniform_buffer in self.uniform_buffers.iter_mut() {
-                self.device
-                    .destroy_buffer(ManuallyDrop::take(uniform_buffer));
-            }
-            self.device
-                .destroy_buffer(ManuallyDrop::take(&mut self.floor_vertex_buffer));
-            self.device
-                .destroy_buffer(ManuallyDrop::take(&mut self.floor_index_buffer));
-            for floor_uniform_buffer in self.floor_uniform_buffers.iter_mut() {
-                self.device
-                    .destroy_buffer(ManuallyDrop::take(floor_uniform_buffer));
-            }
-
-            self.device
+                .logical_device
                 .destroy_image(ManuallyDrop::take(&mut self.depth_image));
 
             self.device
-                .free_memory(ManuallyDrop::take(&mut self.vertex_buffer_memory));
-            self.device
-                .free_memory(ManuallyDrop::take(&mut self.index_buffer_memory));
-            for uniform_buffer_memory in self.uniform_buffers_memory.iter_mut() {
-                self.device
-                    .free_memory(ManuallyDrop::take(uniform_buffer_memory));
-            }
-            self.device
-                .free_memory(ManuallyDrop::take(&mut self.floor_vertex_buffer_memory));
-            self.device
-                .free_memory(ManuallyDrop::take(&mut self.floor_index_buffer_memory));
-            for floor_uniform_buffer_memory in self.floor_uniform_buffers_memory.iter_mut() {
-                self.device
-                    .free_memory(ManuallyDrop::take(floor_uniform_buffer_memory));
-            }
-            self.device
+                .logical_device
                 .free_memory(ManuallyDrop::take(&mut self.depth_image_memory));
 
             self.device
+                .logical_device
                 .destroy_descriptor_pool(ManuallyDrop::take(&mut self.descriptor_pool));
             self.device
+                .logical_device
                 .destroy_descriptor_set_layout(ManuallyDrop::take(&mut self.descriptor_set_layout));
 
             self.device
+                .logical_device
                 .destroy_render_pass(ManuallyDrop::take(&mut self.render_pass));
             self.device
+                .logical_device
                 .destroy_framebuffer(ManuallyDrop::take(&mut self.framebuffer));
-            self.surface.unconfigure_swapchain(&self.device);
+            self.surface
+                .unconfigure_swapchain(&self.device.logical_device);
             self.device
+                .logical_device
                 .destroy_graphics_pipeline(ManuallyDrop::take(&mut self.pipeline));
             self.device
+                .logical_device
                 .destroy_pipeline_layout(ManuallyDrop::take(&mut self.pipeline_layout));
             self.instance
                 .destroy_surface(ManuallyDrop::take(&mut self.surface));
