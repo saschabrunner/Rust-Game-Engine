@@ -7,6 +7,7 @@ use std::{
     mem::{size_of, ManuallyDrop},
     ops::Range,
     ptr,
+    rc::Rc,
     time::Instant,
 };
 
@@ -85,14 +86,45 @@ struct Buffer<B: gfx_hal::Backend> {
 }
 
 struct Image<B: gfx_hal::Backend> {
+    device: Rc<B::Device>,
     image: ManuallyDrop<B::Image>,
     memory: ManuallyDrop<B::Memory>,
 }
 
+impl<B: gfx_hal::Backend> Drop for Image<B> {
+    fn drop(&mut self) {
+        // wait for device to become idle
+        self.device.wait_idle().unwrap();
+
+        unsafe {
+            self.device
+                .destroy_image(ManuallyDrop::take(&mut self.image));
+            self.device
+                .free_memory(ManuallyDrop::take(&mut self.memory));
+        }
+    }
+}
+
 struct Texture<B: gfx_hal::Backend> {
+    device: Rc<B::Device>,
     image: Image<B>,
     image_view: ManuallyDrop<B::ImageView>,
     sampler: ManuallyDrop<B::Sampler>, // TODO: make this sharable between textures
+}
+
+impl<B: gfx_hal::Backend> Drop for Texture<B> {
+    fn drop(&mut self) {
+        // wait for device to become idle
+        self.device.wait_idle().unwrap();
+
+        unsafe {
+            self.device
+                .destroy_image_view(ManuallyDrop::take(&mut self.image_view));
+            self.device
+                .destroy_sampler(ManuallyDrop::take(&mut self.sampler));
+            // drop of image will be called here
+        }
+    }
 }
 
 struct Model<B: gfx_hal::Backend> {
@@ -105,6 +137,14 @@ struct Model<B: gfx_hal::Backend> {
 struct Material<B: gfx_hal::Backend> {
     descriptor_sets: Vec<B::DescriptorSet>, // dependent on frames in flight
                                             // todo: different shader pipelines
+}
+
+// todo: Idea for by frame in flight struct, descriptors and uniform buffers and memory are part of the model, descriptor pools might be put in here though
+struct FrameData<B: gfx_hal::Backend> {
+    submission_complete_semaphore: B::Semaphore,
+    submission_complete_fence: B::Fence,
+    command_pool: B::CommandPool,
+    command_buffer: B::CommandBuffer,
 }
 
 struct Renderer<B: gfx_hal::Backend> {
@@ -133,7 +173,7 @@ struct Renderer<B: gfx_hal::Backend> {
     floor_index_buffer: ManuallyDrop<B::Buffer>,
     floor_uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
     //texture_image: ManuallyDrop<B::Image>,
-    texture: Texture<B>,
+    texture: ManuallyDrop<Texture<B>>, // ManuallyDrop because we need to drop this earlier than others
     depth_image: ManuallyDrop<B::Image>, //todo: per frame in flight
     vertex_buffer_memory: ManuallyDrop<B::Memory>,
     index_buffer_memory: ManuallyDrop<B::Memory>,
@@ -151,7 +191,11 @@ struct Renderer<B: gfx_hal::Backend> {
     frame: u64,
     start_time: Instant,
     // these are dropped in the order they are declared, very important!
-    device: B::Device,
+    // currently assuming that during drop, this struct is the only one with a ref to device!
+    // every other struct that has a handle on this device should have been dropped at this point already
+    // alternatively, a function could be created to get a more short lived reference to the device
+    // then Rc wouldn't be needed at all
+    device: Rc<B::Device>,
     adapter: Adapter<B>,
     queue_group: QueueGroup<B>,
     instance: B::Instance,
@@ -173,7 +217,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 .expect("Failed to open device")
         };
 
-        let device = gpu.device;
+        let device = Rc::new(gpu.device);
         let mut queue_group = gpu.queue_groups.pop().unwrap();
 
         // limit amount of frames calculated simultaneously to avoid the CPU outrunning the GPU
@@ -1369,13 +1413,13 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     // }
 
     fn create_texture(
-        device: &B::Device,
+        device: &Rc<B::Device>,
         queue_group: &mut QueueGroup<B>,
         command_pool: &mut B::CommandPool,
         limits: &gfx_hal::Limits,
         memory_types: &[MemoryType],
         raw_image: &image::RgbaImage,
-    ) -> Texture<B> {
+    ) -> ManuallyDrop<Texture<B>> {
         let buffer_len = raw_image.width() * raw_image.height() * 4;
         let padded_buffer_len = ((buffer_len as usize + limits.non_coherent_atom_size - 1)
             / limits.non_coherent_atom_size
@@ -1455,14 +1499,16 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         );
         let texture_sampler = Self::create_texture_sampler(&device);
 
-        Texture {
+        ManuallyDrop::new(Texture {
+            device: device.clone(),
             image: Image {
+                device: device.clone(),
                 image: texture_image,
                 memory: texture_memory,
             },
             image_view: texture_image_view,
             sampler: texture_sampler,
-        }
+        })
     }
 
     fn create_image_view(
@@ -1703,11 +1749,8 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                 self.device.destroy_fence(submission_complete_fence);
             }
 
-            // todo: move drop implementation into specific structs
-            self.device
-                .destroy_image_view(ManuallyDrop::take(&mut self.texture.image_view));
-            self.device
-                .destroy_sampler(ManuallyDrop::take(&mut self.texture.sampler));
+            // drop texture and all its images/memory
+            ManuallyDrop::drop(&mut self.texture);
 
             self.device
                 .destroy_image_view(ManuallyDrop::take(&mut self.depth_image_view));
@@ -1730,8 +1773,6 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
             }
 
             self.device
-                .destroy_image(ManuallyDrop::take(&mut self.texture.image.image));
-            self.device
                 .destroy_image(ManuallyDrop::take(&mut self.depth_image));
 
             self.device
@@ -1750,8 +1791,6 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                 self.device
                     .free_memory(ManuallyDrop::take(floor_uniform_buffer_memory));
             }
-            self.device
-                .free_memory(ManuallyDrop::take(&mut self.texture.image.memory));
             self.device
                 .free_memory(ManuallyDrop::take(&mut self.depth_image_memory));
 
