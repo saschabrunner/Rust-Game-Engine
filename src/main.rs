@@ -87,12 +87,12 @@ struct Buffer<B: gfx_hal::Backend> {
 }
 
 impl<B: gfx_hal::Backend> Buffer<B> {
-    fn create(
+    fn new(
         device: &Rc<Device<B>>,
         buffer_len: u64,
         usage: buffer::Usage,
         properties: memory::Properties,
-    ) -> Buffer<B> {
+    ) -> Self {
         let mut buffer = ManuallyDrop::new(
             unsafe {
                 device
@@ -164,14 +164,49 @@ impl<B: gfx_hal::Backend> Drop for Image<B> {
     }
 }
 
-struct Texture<B: gfx_hal::Backend> {
+struct ImageView<B: gfx_hal::Backend> {
     device: Rc<Device<B>>,
     image: Image<B>,
     image_view: ManuallyDrop<B::ImageView>,
-    sampler: ManuallyDrop<B::Sampler>, // TODO: make this sharable between textures
 }
 
-impl<B: gfx_hal::Backend> Drop for Texture<B> {
+impl<B: gfx_hal::Backend> ImageView<B> {
+    pub fn new(
+        device: &Rc<Device<B>>,
+        image: Image<B>,
+        format: Format,
+        aspects: Aspects,
+        usage: gfximg::Usage,
+    ) -> Self {
+        let iv = ManuallyDrop::new(
+            unsafe {
+                device.logical_device.create_image_view(
+                    &image.image,
+                    ViewKind::D2,
+                    format,
+                    Swizzle::NO,
+                    usage,
+                    SubresourceRange {
+                        aspects: aspects,
+                        level_start: 0,
+                        level_count: None,
+                        layer_start: 0,
+                        layer_count: None,
+                    },
+                )
+            }
+            .unwrap(),
+        );
+
+        ImageView {
+            device: device.clone(),
+            image: image,
+            image_view: iv,
+        }
+    }
+}
+
+impl<B: gfx_hal::Backend> Drop for ImageView<B> {
     fn drop(&mut self) {
         // wait for device to become idle
         self.device.logical_device.wait_idle().unwrap();
@@ -180,9 +215,6 @@ impl<B: gfx_hal::Backend> Drop for Texture<B> {
             self.device
                 .logical_device
                 .destroy_image_view(ManuallyDrop::take(&mut self.image_view));
-            self.device
-                .logical_device
-                .destroy_sampler(ManuallyDrop::take(&mut self.sampler));
             // drop of image will be called here
         }
     }
@@ -253,8 +285,7 @@ struct Renderer<B: gfx_hal::Backend> {
     command_pools: Vec<B::CommandPool>,
     command_buffers: Vec<B::CommandBuffer>,
     //texture_image_view: ManuallyDrop<B::ImageView>,
-    depth_image_view: ManuallyDrop<B::ImageView>,
-    //texture_sampler: ManuallyDrop<B::Sampler>,
+    depth_image_views: Vec<ImageView<B>>,
     vertex_buffer: ManuallyDrop<Buffer<B>>,
     index_buffer: ManuallyDrop<Buffer<B>>,
     uniform_buffers: Vec<ManuallyDrop<Buffer<B>>>,
@@ -268,9 +299,9 @@ struct Renderer<B: gfx_hal::Backend> {
     //floor_index_buffer: ManuallyDrop<B::Buffer>,
     //floor_uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
     //texture_image: ManuallyDrop<B::Image>,
-    texture: ManuallyDrop<Texture<B>>, // ManuallyDrop because we need to drop this earlier than others
+    texture_sampler: ManuallyDrop<B::Sampler>,
+    textures: Vec<ImageView<B>>, // Vec can be cleared to drop elements, no ManuallyDrop required
     //depth_image: ManuallyDrop<B::Image>, //todo: per frame in flight
-    depth_image: ManuallyDrop<Image<B>>, // todo: per frame in flight
     //vertex_buffer_memory: ManuallyDrop<B::Memory>,
     //index_buffer_memory: ManuallyDrop<B::Memory>,
     //uniform_buffers_memory: Vec<ManuallyDrop<B::Memory>>,
@@ -380,7 +411,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 .expect("Failed to configure swapchain");
         }
 
-        let image = image::load(
+        let image_ground = image::load(
             Cursor::new(include_bytes!(
                 "../data/textures/Ground037_1K-PNG/Ground037_1K_Color.png"
             )),
@@ -389,10 +420,31 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         .unwrap()
         .to_rgba8();
 
-        let texture =
-            Self::create_texture(&device, &mut queue_group, &mut command_pools[0], &image);
+        let texture_ground = Self::create_texture(
+            &device,
+            &mut queue_group,
+            &mut command_pools[0],
+            &image_ground,
+        );
 
-        let descriptor_set_layout = Self::create_descriptor_set_layout(&device);
+        let image_planks = image::load(
+            Cursor::new(include_bytes!(
+                "../data/textures/Planks016_1K-PNG/Planks016_1K_Color.png"
+            )),
+            image::ImageFormat::Png,
+        )
+        .unwrap()
+        .to_rgba8();
+
+        let texture_planks = Self::create_texture(
+            &device,
+            &mut queue_group,
+            &mut command_pools[0],
+            &image_planks,
+        );
+
+        let texture_sampler = Self::create_texture_sampler(&device);
+        let descriptor_set_layout = Self::create_descriptor_set_layout(&device, &texture_sampler);
         let uniform_buffers = Self::create_uniform_buffers(&device, frames_in_flight);
         let mut descriptor_pool = Self::create_descriptor_pool(&device, frames_in_flight);
         let descriptor_sets = Self::create_descriptor_sets(
@@ -400,28 +452,12 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             &descriptor_set_layout,
             &mut descriptor_pool,
             &uniform_buffers,
-            &texture.image_view, // todo: make single arg
-            &texture.sampler,
+            &texture_planks,
             frames_in_flight,
         );
 
-        let depth_image = ManuallyDrop::new(Self::create_image(
-            &device,
-            surface_extent.width,
-            surface_extent.height,
-            depth_format,
-            gfximg::Tiling::Optimal,
-            gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
-            memory::Properties::DEVICE_LOCAL,
-        ));
-
-        let depth_image_view = Self::create_image_view(
-            &device,
-            &depth_image.image,
-            depth_format,
-            Aspects::DEPTH, // todo: stencil aspect
-            gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
-        );
+        let depth_image_views =
+            Self::create_depth_images(&device, surface_extent, depth_format, frames_in_flight);
 
         let render_pass = Self::create_render_pass(&device, surface_format, depth_format);
 
@@ -457,8 +493,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             &descriptor_set_layout,
             &mut descriptor_pool,
             &floor_uniform_buffers,
-            &texture.image_view, // todo: make single arg
-            &texture.sampler,
+            &texture_ground,
             frames_in_flight,
         );
 
@@ -538,9 +573,9 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             command_pools,
             command_buffers,
             //texture_image_view,
-            texture,
-            depth_image_view,
-            //texture_sampler,
+            texture_sampler,
+            textures: vec![texture_ground, texture_planks],
+            depth_image_views,
             vertex_buffer,
             index_buffer,
             uniform_buffers,
@@ -548,7 +583,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             floor_index_buffer,
             floor_uniform_buffers,
             //texture_image,
-            depth_image,
+            //depth_image,
             //index_buffer_memory,
             //uniform_buffers_memory,
             //floor_index_buffer_memory,
@@ -587,10 +622,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             self.device
                 .logical_device
                 .destroy_framebuffer(ManuallyDrop::take(&mut self.framebuffer));
-            self.device
-                .logical_device
-                .destroy_image_view(ManuallyDrop::take(&mut self.depth_image_view));
-            ManuallyDrop::drop(&mut self.depth_image);
+            self.depth_image_views.clear();
 
             let depth_attachment = FramebufferAttachment {
                 usage: gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
@@ -618,26 +650,12 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         }
 
         // recreate depth buffer
-        let depth_image = ManuallyDrop::new(Self::create_image(
+        self.depth_image_views = Self::create_depth_images(
             &self.device,
-            self.surface_extent.width,
-            self.surface_extent.height,
+            self.surface_extent,
             self.depth_format,
-            gfximg::Tiling::Optimal,
-            gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
-            memory::Properties::DEVICE_LOCAL,
-        ));
-
-        let depth_image_view = Self::create_image_view(
-            &self.device,
-            &depth_image.image,
-            self.depth_format,
-            Aspects::DEPTH, // todo: stencil aspect
-            gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+            self.frames_in_flight,
         );
-
-        self.depth_image = depth_image;
-        self.depth_image_view = depth_image_view;
 
         self.camera.set_surface_extent(self.surface_extent);
     }
@@ -738,7 +756,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                         },
                     },
                     RenderAttachmentInfo {
-                        image_view: &*self.depth_image_view, // borrow only works for SwapchainImage
+                        image_view: &*self.depth_image_views[frame_id].image_view, // borrow only works for SwapchainImage
                         clear_value: ClearValue {
                             depth_stencil: ClearDepthStencil {
                                 depth: 1.0,
@@ -867,8 +885,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         Self::find_compatible_format(
             physical_device,
             vec![
+                Format::D24UnormS8Uint, // nvidia recommends 24bit depth formats https://developer.nvidia.com/blog/vulkan-dos-donts/
                 Format::D32Sfloat,
-                Format::D24UnormS8Uint,
                 Format::D32SfloatS8Uint,
             ]
             .iter(),
@@ -1155,7 +1173,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             / device.limits.non_coherent_atom_size
             * device.limits.non_coherent_atom_size) as u64;
 
-        let mut staging_buffer = Buffer::create(
+        let mut staging_buffer = Buffer::new(
             device,
             padded_buffer_len,
             buffer::Usage::TRANSFER_SRC,
@@ -1172,7 +1190,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             )
         };
 
-        let buffer = Buffer::create(
+        let buffer = Buffer::new(
             device,
             buffer_len as u64,
             buffer::Usage::TRANSFER_DST | buffer::Usage::VERTEX,
@@ -1204,7 +1222,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             / device.limits.non_coherent_atom_size
             * device.limits.non_coherent_atom_size) as u64;
 
-        let mut staging_buffer = Buffer::create(
+        let mut staging_buffer = Buffer::new(
             device,
             padded_buffer_len,
             buffer::Usage::TRANSFER_SRC,
@@ -1220,7 +1238,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             )
         };
 
-        let buffer = Buffer::create(
+        let buffer = Buffer::new(
             device,
             buffer_len as u64,
             buffer::Usage::TRANSFER_DST | buffer::Usage::INDEX,
@@ -1241,6 +1259,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
     fn create_descriptor_set_layout(
         device: &Rc<Device<B>>,
+        sampler: &B::Sampler,
     ) -> ManuallyDrop<B::DescriptorSetLayout> {
         ManuallyDrop::new(
             unsafe {
@@ -1265,11 +1284,11 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                             },
                             count: 1,
                             stage_flags: ShaderStageFlags::FRAGMENT,
-                            immutable_samplers: false,
+                            immutable_samplers: true,
                         },
                     ]
                     .into_iter(),
-                    iter::empty(),
+                    iter::once(sampler),
                 )
             }
             .expect("Out of memory creating descriptor set layout"),
@@ -1286,7 +1305,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             / device.limits.non_coherent_atom_size
             * device.limits.non_coherent_atom_size) as u64;
         for _ in 0..frames_in_flight {
-            let uniform_buffer = Buffer::create(
+            let uniform_buffer = Buffer::new(
                 device,
                 padded_length,
                 buffer::Usage::UNIFORM,
@@ -1339,8 +1358,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         descriptor_set_layout: &B::DescriptorSetLayout,
         descriptor_pool: &mut B::DescriptorPool,
         uniform_buffers: &[ManuallyDrop<Buffer<B>>],
-        image_view: &B::ImageView,
-        sampler: &B::Sampler,
+        image_view: &ImageView<B>,
         frames_in_flight: usize,
     ) -> Vec<B::DescriptorSet> {
         let mut descriptor_sets = Vec::with_capacity(frames_in_flight);
@@ -1362,10 +1380,11 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                         descriptors: vec![
                             Descriptor::Buffer(&*uniform_buffers[i].buffer, SubRange::WHOLE),
                             // instead of a combined image sampler, we could also use a separate image and a sampler descriptor
-                            Descriptor::CombinedImageSampler(
-                                image_view,
+                            // however, in this case we are not even using CombinedImageSampler, because the sampler is defined
+                            // immutable, therefore we only provide the image view
+                            Descriptor::Image(
+                                &*image_view.image_view,
                                 Layout::ShaderReadOnlyOptimal,
-                                sampler,
                             ),
                         ]
                         .into_iter(),
@@ -1381,13 +1400,13 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         queue_group: &mut QueueGroup<B>,
         command_pool: &mut B::CommandPool,
         raw_image: &image::RgbaImage,
-    ) -> ManuallyDrop<Texture<B>> {
+    ) -> ImageView<B> {
         let buffer_len = raw_image.width() * raw_image.height() * 4;
         let padded_buffer_len = ((buffer_len as usize + device.limits.non_coherent_atom_size - 1)
             / device.limits.non_coherent_atom_size
             * device.limits.non_coherent_atom_size) as u64;
 
-        let mut staging_buffer = Buffer::create(
+        let mut staging_buffer = Buffer::new(
             device,
             padded_buffer_len,
             buffer::Usage::TRANSFER_SRC,
@@ -1444,49 +1463,12 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             Layout::TransferDstOptimal..Layout::ShaderReadOnlyOptimal,
         );
 
-        let texture_image_view = Self::create_image_view(
+        ImageView::new(
             device,
-            &texture_image.image,
+            texture_image,
             Format::Rgba8Srgb,
             Aspects::COLOR,
             gfximg::Usage::SAMPLED,
-        );
-        let texture_sampler = Self::create_texture_sampler(device);
-
-        ManuallyDrop::new(Texture {
-            device: device.clone(),
-            image: texture_image,
-            image_view: texture_image_view,
-            sampler: texture_sampler,
-        })
-    }
-
-    fn create_image_view(
-        device: &Rc<Device<B>>,
-        image: &B::Image,
-        format: Format,
-        aspects: Aspects,
-        usage: gfximg::Usage,
-    ) -> ManuallyDrop<B::ImageView> {
-        // todo: find a better return type / put it into a struct
-        ManuallyDrop::new(
-            unsafe {
-                device.logical_device.create_image_view(
-                    image,
-                    ViewKind::D2,
-                    format,
-                    Swizzle::NO,
-                    usage,
-                    SubresourceRange {
-                        aspects: aspects,
-                        level_start: 0,
-                        level_count: None,
-                        layer_start: 0,
-                        layer_count: None,
-                    },
-                )
-            }
-            .unwrap(),
         )
     }
 
@@ -1501,6 +1483,39 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             }
             .unwrap(),
         )
+    }
+
+    fn create_depth_images(
+        device: &Rc<Device<B>>,
+        surface_extent: Extent2D,
+        depth_format: Format,
+        frames_in_flight: usize,
+    ) -> Vec<ImageView<B>> {
+        let mut image_views = Vec::with_capacity(frames_in_flight);
+
+        for _ in 0..frames_in_flight {
+            let depth_image = Self::create_image(
+                device,
+                surface_extent.width,
+                surface_extent.height,
+                depth_format,
+                gfximg::Tiling::Optimal,
+                gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+                memory::Properties::DEVICE_LOCAL,
+            );
+
+            let depth_image_view = ImageView::new(
+                device,
+                depth_image,
+                depth_format,
+                Aspects::DEPTH, // todo: stencil aspect
+                gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+            );
+
+            image_views.push(depth_image_view);
+        }
+
+        image_views
     }
 
     fn create_render_pass(
@@ -1696,8 +1711,13 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                     .destroy_fence(submission_complete_fence);
             }
 
-            // drop textures and buffers
-            ManuallyDrop::drop(&mut self.texture);
+            self.device
+                .logical_device
+                .destroy_sampler(ManuallyDrop::take(&mut self.texture_sampler));
+
+            // drop images and buffers
+            self.textures.clear();
+            self.depth_image_views.clear();
             ManuallyDrop::drop(&mut self.vertex_buffer);
             ManuallyDrop::drop(&mut self.floor_vertex_buffer);
             ManuallyDrop::drop(&mut self.index_buffer);
@@ -1708,11 +1728,6 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
             for floor_uniform_buffer in self.floor_uniform_buffers.iter_mut() {
                 ManuallyDrop::drop(floor_uniform_buffer);
             }
-
-            ManuallyDrop::drop(&mut self.depth_image);
-            self.device
-                .logical_device
-                .destroy_image_view(ManuallyDrop::take(&mut self.depth_image_view));
 
             self.device
                 .logical_device
