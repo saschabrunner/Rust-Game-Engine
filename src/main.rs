@@ -261,19 +261,176 @@ impl<B: gfx_hal::Backend> Drop for ImageView<B> {
     }
 }
 
-struct Model<B: gfx_hal::Backend> {
-    vertex_buffer: Buffer<B>,
-    index_buffer: Buffer<B>,
-    model_transforms: Vec<ModelTransform<B>>, // unique, per frame in flight
-    view_projection_transform: Vec<ViewProjectionTransform<B>>, // shared, per frame in flight
-}
-
 struct Material<B: gfx_hal::Backend> {
     descriptor_sets: Vec<B::DescriptorSet>, // dependent on frames in flight
                                             // todo: different shader pipelines
 }
 
-// todo: Idea for by frame in flight struct, descriptors and uniform buffers and memory are part of the model, descriptor pools might be put in here though
+impl<B: gfx_hal::Backend> Material<B> {
+    unsafe fn new() -> Material<B> {
+        // todo
+        Material {
+            descriptor_sets: vec![],
+        }
+    }
+}
+
+struct Pipeline<B: gfx_hal::Backend> {
+    device: Rc<Device<B>>,
+    pipeline: ManuallyDrop<B::GraphicsPipeline>,
+    viewport: Viewport,
+}
+
+impl<B: gfx_hal::Backend> Pipeline<B> {
+    pub unsafe fn new(
+        // todo: add more configuration options
+        // perhaps introduce a config struct which implements Default
+        device: &Rc<Device<B>>,
+        pipeline_layout: &B::PipelineLayout,
+        subpass: Subpass<B>,
+        vertex_shader: &[u32],
+        fragment_shader: &[u32],
+        surface_extent: Extent2D,
+    ) -> Self {
+        let vertex_shader_module = device
+            .logical_device
+            .create_shader_module(vertex_shader)
+            .expect("Failed to create vertex shader module");
+
+        let fragment_shader_module = device
+            .logical_device
+            .create_shader_module(fragment_shader)
+            .expect("Failed to create fragment shader module");
+
+        let (vs_entry, fs_entry) = (
+            EntryPoint {
+                entry: "main",
+                module: &vertex_shader_module,
+                specialization: Specialization::default(), // specializations can be used for constants later
+            },
+            EntryPoint {
+                entry: "main",
+                module: &fragment_shader_module,
+                specialization: Specialization::default(),
+            },
+        );
+
+        // https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Fixed_functions
+        let primitive_assembler = PrimitiveAssemblerDesc::Vertex {
+            buffers: &[VertexBufferDesc {
+                binding: 0,
+                stride: size_of::<Vertex>() as u32,
+                rate: VertexInputRate::Vertex,
+            }],
+            attributes: &[
+                AttributeDesc {
+                    location: 0,
+                    binding: 0, // is equal to the number in the VertexBufferDesc
+                    element: pso::Element {
+                        format: Format::Rgb32Sfloat,
+                        offset: 0,
+                    },
+                },
+                AttributeDesc {
+                    location: 1,
+                    binding: 0,
+                    element: pso::Element {
+                        format: Format::Rgb32Sfloat,
+                        offset: 12, // an offset_of library or offset_from may be considered here
+                    },
+                },
+                AttributeDesc {
+                    location: 2,
+                    binding: 0,
+                    element: pso::Element {
+                        format: Format::Rg32Sfloat,
+                        offset: 24,
+                    },
+                },
+            ],
+            input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
+            vertex: vs_entry,
+            tessellation: None,
+            geometry: None,
+        };
+
+        let mut pipeline_desc = GraphicsPipelineDesc::new(
+            primitive_assembler,
+            Rasterizer {
+                cull_face: Face::BACK,
+                ..Rasterizer::FILL // this is the struct update syntax
+            },
+            Some(fs_entry),
+            pipeline_layout,
+            // every subpass requires its own pipeline
+            // so we refer to a specific supbpass of the renderpass
+            subpass,
+        );
+
+        pipeline_desc.depth_stencil = DepthStencilDesc {
+            depth: Some(DepthTest {
+                fun: gfx_hal::pso::Comparison::Less,
+                write: true,
+            }),
+            depth_bounds: false,
+            stencil: None,
+        };
+
+        pipeline_desc.blender.targets.push(ColorBlendDesc {
+            mask: ColorMask::ALL,
+            blend: Some(BlendState::ALPHA),
+        });
+
+        let pipeline = ManuallyDrop::new(
+            device
+                .logical_device
+                .create_graphics_pipeline(&pipeline_desc, None)
+                .expect("Failed to create graphics pipeline"),
+        );
+
+        // shader modules can be destroyed now, since the pipeline compiled
+        // them to machine code and we don't need the spir-v intermediate anymore
+        device
+            .logical_device
+            .destroy_shader_module(vertex_shader_module);
+        device
+            .logical_device
+            .destroy_shader_module(fragment_shader_module);
+
+        let viewport = Viewport {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                w: surface_extent.width as i16,
+                h: surface_extent.height as i16,
+            },
+            depth: 0.0..1.0,
+        };
+
+        Pipeline {
+            device: device.clone(),
+            pipeline,
+            viewport,
+        }
+    }
+
+    pub fn update_dimensions(&mut self, surface_extent: Extent2D) {
+        self.viewport.rect.w = surface_extent.width as i16;
+        self.viewport.rect.h = surface_extent.height as i16;
+    }
+}
+
+impl<B: gfx_hal::Backend> Drop for Pipeline<B> {
+    fn drop(&mut self) {
+        unsafe {
+            self.device
+                .logical_device
+                .destroy_graphics_pipeline(ManuallyDrop::take(&mut self.pipeline));
+        }
+    }
+}
+
+// todo: where to put descriptor pools?
 struct FrameResources<B: gfx_hal::Backend> {
     device: Rc<Device<B>>,
     submission_complete_semaphore: ManuallyDrop<B::Semaphore>,
@@ -284,7 +441,7 @@ struct FrameResources<B: gfx_hal::Backend> {
 }
 
 impl<B: gfx_hal::Backend> FrameResources<B> {
-    unsafe fn new(
+    pub unsafe fn new(
         device: &Rc<Device<B>>,
         queue_family: QueueFamilyId,
         surface_extent: Extent2D,
@@ -414,10 +571,11 @@ struct Renderer<B: gfx_hal::Backend> {
     surface_format: Format,
     depth_format: Format,
     surface_extent: Extent2D,
-    viewport: Viewport,
+    //viewport: Viewport,
     render_pass: ManuallyDrop<B::RenderPass>,
     framebuffer: ManuallyDrop<B::Framebuffer>,
-    pipeline: ManuallyDrop<B::GraphicsPipeline>,
+    //pipeline: ManuallyDrop<B::GraphicsPipeline>,
+    pipeline: ManuallyDrop<Pipeline<B>>,
     pipeline_layout: ManuallyDrop<B::PipelineLayout>,
     //pipeline_cache: ManuallyDrop<B::PipelineCache> // todo: should I add this?
     //submission_complete_semaphores: Vec<B::Semaphore>,
@@ -502,16 +660,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // update surface extent, since the swapchain might enforce different dimensions
         let surface_extent = swapchain_config.extent;
-
-        let viewport = Viewport {
-            rect: Rect {
-                x: 0,
-                y: 0,
-                w: surface_extent.width as i16,
-                h: surface_extent.height as i16,
-            },
-            depth: 0.0..1.0,
-        };
 
         unsafe {
             surface
@@ -611,6 +759,9 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             frames_in_flight,
         );
 
+        // same pipeline layout can be used between pipelines
+        // similar pipeline layouts are advantagous, where the same layouts are at the same slots across layouts
+        // https://developer.nvidia.com/vulkan-shader-resource-binding
         let pipeline_layout = ManuallyDrop::new(unsafe {
             device
                 .logical_device
@@ -628,15 +779,19 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         )))
         .unwrap();
 
-        let pipeline = unsafe {
-            Self::make_pipeline(
+        let pipeline = ManuallyDrop::new(unsafe {
+            Pipeline::new(
                 &device,
-                &render_pass,
-                &*pipeline_layout,
+                &pipeline_layout,
+                Subpass {
+                    index: 0,
+                    main_pass: &render_pass,
+                },
                 &vertex_shader,
                 &fragment_shader,
+                surface_extent,
             )
-        };
+        });
 
         // framebuffer connects attachments to images
         // attachments can be thought of as the slots
@@ -677,7 +832,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             surface_format,
             depth_format,
             surface_extent,
-            viewport,
             render_pass,
             framebuffer,
             pipeline,
@@ -727,9 +881,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         // update surface extent, since the swapchain might enforce different dimensions
         self.surface_extent = swapchain_config.extent;
 
-        self.viewport.rect.w = self.surface_extent.width as i16;
-        self.viewport.rect.h = self.surface_extent.height as i16;
-
         unsafe {
             self.device.logical_device.wait_idle().unwrap();
 
@@ -770,6 +921,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             }
         }
 
+        self.pipeline.update_dimensions(self.surface_extent);
         self.camera.set_surface_extent(self.surface_extent);
     }
 
@@ -823,7 +975,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // copy data into uniform buffer
         unsafe {
-            Self::copy_into_memory(
+            copy_into_memory(
                 &self.device,
                 &transformations as *const Transformations as *const u8,
                 &mut self.uniform_buffers[frame_id].memory,
@@ -834,11 +986,13 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         let command_buffer = &mut *frame_resources.command_buffer;
         unsafe {
             command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
-            // viewports and scissors are part of the command buffer, different to Vulkan
-            command_buffer.set_viewports(0, iter::once(self.viewport.clone()));
-            command_buffer.set_scissors(0, iter::once(self.viewport.rect));
 
-            command_buffer.bind_graphics_pipeline(&self.pipeline);
+            // viewports and scissors are part of the command buffer, known as dynamic viewports and scissors in vulkan
+            // todo: make own function in pipeline impl
+            command_buffer.set_viewports(0, iter::once(self.pipeline.viewport.clone()));
+            command_buffer.set_scissors(0, iter::once(self.pipeline.viewport.rect));
+            command_buffer.bind_graphics_pipeline(&self.pipeline.pipeline);
+
             command_buffer.bind_vertex_buffers(
                 0,
                 iter::once((&*self.vertex_buffer.buffer, SubRange::WHOLE)),
@@ -858,7 +1012,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             command_buffer.begin_render_pass(
                 &self.render_pass,
                 &self.framebuffer,
-                self.viewport.rect,
+                self.pipeline.viewport.rect,
                 // clear value is part of each render attachment info
                 vec![
                     RenderAttachmentInfo {
@@ -896,7 +1050,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                     projection,
                 };
 
-                Self::copy_into_memory(
+                copy_into_memory(
                     &self.device,
                     &transformations as *const Transformations as *const u8,
                     &mut self.floor_uniform_buffers[frame_id].memory,
@@ -1104,131 +1258,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         }
     }
 
-    fn copy_buffer_to_image(
-        device: &Rc<Device<B>>,
-        queue_group: &mut QueueGroup<B>,
-        source: &B::Buffer,
-        destination: &B::Image,
-        command_pool: &mut B::CommandPool,
-        width: u32,
-        height: u32,
-    ) {
-        let mut copy_fence = device
-            .logical_device
-            .create_fence(false)
-            .expect("Out of memory creating fence");
-
-        unsafe {
-            let mut command_buffer = command_pool.allocate_one(Level::Primary);
-            command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
-
-            command_buffer.copy_buffer_to_image(
-                &source,
-                &destination,
-                Layout::TransferDstOptimal,
-                iter::once(BufferImageCopy {
-                    buffer_offset: 0,
-                    buffer_width: width,
-                    buffer_height: height,
-                    image_layers: SubresourceLayers {
-                        aspects: Aspects::COLOR,
-                        level: 0,
-                        layers: 0..1,
-                    },
-                    image_offset: gfximg::Offset::ZERO,
-                    image_extent: Extent {
-                        width: width,
-                        height: height,
-                        depth: 1,
-                    },
-                }),
-            );
-            command_buffer.finish();
-            queue_group.queues[0].submit(
-                iter::once(&command_buffer),
-                iter::empty(),
-                iter::empty(),
-                Some(&mut copy_fence),
-            );
-
-            device
-                .logical_device
-                .wait_for_fence(&copy_fence, !0)
-                .unwrap();
-            command_pool.free(iter::once(command_buffer));
-            device.logical_device.destroy_fence(copy_fence);
-        }
-    }
-
-    /// Copies into a CPU visible buffer, undefined behavior if memory is not CPU visible!
-    unsafe fn copy_into_memory(
-        device: &Rc<Device<B>>,
-        source: *const u8,
-        destination: &mut B::Memory,
-        len: usize,
-    ) {
-        let mapping = device
-            .logical_device
-            .map_memory(destination, Segment::ALL)
-            .unwrap();
-        ptr::copy_nonoverlapping(source, mapping, len);
-
-        // manually flush the memory, so that it is ensured to be available to the GPU.
-        // if instead limited buffer_memory_type to a type that contains the property
-        // memory::Properties::COHERENT, we wouldn't have to explicitly flush, possible
-        // optimization for the future.
-        // either way however, the memory is not guaranteed to be visible on the GPU yet
-        // until we submit our queue, according to the specification.
-        device
-            .logical_device
-            .flush_mapped_memory_ranges(iter::once((&*destination, Segment::ALL)))
-            .unwrap();
-
-        device.logical_device.unmap_memory(destination);
-    }
-
-    fn copy_buffer(
-        device: &Rc<Device<B>>,
-        queue_group: &mut QueueGroup<B>,
-        source: &B::Buffer,
-        destination: &B::Buffer,
-        command_pool: &mut B::CommandPool,
-        len: u64,
-    ) {
-        let mut copy_fence = device
-            .logical_device
-            .create_fence(false)
-            .expect("Out of memory creating fence");
-
-        unsafe {
-            let mut command_buffer = command_pool.allocate_one(Level::Primary);
-            command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
-            command_buffer.copy_buffer(
-                &*source,
-                &*destination,
-                iter::once(BufferCopy {
-                    src: 0,
-                    dst: 0,
-                    size: len as u64,
-                }),
-            );
-            command_buffer.finish();
-            queue_group.queues[0].submit(
-                iter::once(&command_buffer),
-                iter::empty(),
-                iter::empty(),
-                Some(&mut copy_fence),
-            );
-
-            device
-                .logical_device
-                .wait_for_fence(&copy_fence, !0)
-                .unwrap();
-            command_pool.free(iter::once(command_buffer));
-            device.logical_device.destroy_fence(copy_fence);
-        }
-    }
-
     fn create_vertex_buffer(
         device: &Rc<Device<B>>,
         queue_group: &mut QueueGroup<B>,
@@ -1253,7 +1282,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         // copy data into staging buffer
         unsafe {
-            Self::copy_into_memory(
+            copy_into_memory(
                 device,
                 vertices.as_ptr() as *const u8,
                 &mut staging_buffer.memory,
@@ -1271,7 +1300,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         };
 
         // copy staging buffer into final buffer
-        Self::copy_buffer(
+        copy_buffer(
             device,
             queue_group,
             &staging_buffer.buffer,
@@ -1305,7 +1334,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         };
 
         unsafe {
-            Self::copy_into_memory(
+            copy_into_memory(
                 device,
                 indices.as_ptr() as *const u8,
                 &mut staging_buffer.memory,
@@ -1322,7 +1351,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             )
         };
 
-        Self::copy_buffer(
+        copy_buffer(
             device,
             queue_group,
             &staging_buffer.buffer,
@@ -1495,7 +1524,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         };
 
         unsafe {
-            Self::copy_into_memory(
+            copy_into_memory(
                 device,
                 raw_image.as_ptr(),
                 &mut staging_buffer.memory,
@@ -1526,7 +1555,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         );
 
         // copy buffer to image
-        Self::copy_buffer_to_image(
+        copy_buffer_to_image(
             device,
             queue_group,
             &staging_buffer.buffer,
@@ -1619,120 +1648,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 .expect("Out of memory creating render pass")
         })
     }
-
-    unsafe fn make_pipeline(
-        device: &Rc<Device<B>>,
-        render_pass: &B::RenderPass,
-        pipeline_layout: &B::PipelineLayout,
-        vertex_shader: &[u32],
-        fragment_shader: &[u32],
-    ) -> ManuallyDrop<B::GraphicsPipeline> {
-        let vertex_shader_module = device
-            .logical_device
-            .create_shader_module(vertex_shader)
-            .expect("Failed to create vertex shader module");
-
-        let fragment_shader_module = device
-            .logical_device
-            .create_shader_module(fragment_shader)
-            .expect("Failed to create fragment shader module");
-
-        let (vs_entry, fs_entry) = (
-            EntryPoint {
-                entry: "main",
-                module: &vertex_shader_module,
-                specialization: Specialization::default(), // specializations can be used for constants later
-            },
-            EntryPoint {
-                entry: "main",
-                module: &fragment_shader_module,
-                specialization: Specialization::default(),
-            },
-        );
-
-        // https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Fixed_functions
-        let primitive_assembler = PrimitiveAssemblerDesc::Vertex {
-            buffers: &[VertexBufferDesc {
-                binding: 0,
-                stride: size_of::<Vertex>() as u32,
-                rate: VertexInputRate::Vertex,
-            }],
-            attributes: &[
-                AttributeDesc {
-                    location: 0,
-                    binding: 0, // is equal to the number in the VertexBufferDesc
-                    element: pso::Element {
-                        format: Format::Rgb32Sfloat,
-                        offset: 0,
-                    },
-                },
-                AttributeDesc {
-                    location: 1,
-                    binding: 0,
-                    element: pso::Element {
-                        format: Format::Rgb32Sfloat,
-                        offset: 12, // an offset_of library or offset_from may be considered here
-                    },
-                },
-                AttributeDesc {
-                    location: 2,
-                    binding: 0,
-                    element: pso::Element {
-                        format: Format::Rg32Sfloat,
-                        offset: 24,
-                    },
-                },
-            ],
-            input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
-            vertex: vs_entry,
-            tessellation: None,
-            geometry: None,
-        };
-
-        let mut pipeline_desc = GraphicsPipelineDesc::new(
-            primitive_assembler,
-            Rasterizer {
-                cull_face: Face::BACK,
-                ..Rasterizer::FILL // this is the struct update syntax
-            },
-            Some(fs_entry),
-            pipeline_layout,
-            Subpass {
-                index: 0,
-                main_pass: render_pass,
-            },
-        );
-
-        pipeline_desc.depth_stencil = DepthStencilDesc {
-            depth: Some(DepthTest {
-                fun: gfx_hal::pso::Comparison::Less,
-                write: true,
-            }),
-            depth_bounds: false,
-            stencil: None,
-        };
-
-        pipeline_desc.blender.targets.push(ColorBlendDesc {
-            mask: ColorMask::ALL,
-            blend: Some(BlendState::ALPHA),
-        });
-
-        let pipeline = device
-            .logical_device
-            .create_graphics_pipeline(&pipeline_desc, None)
-            .expect("Failed to create graphics pipeline");
-
-        // shader modules can be destroyed now, since the pipeline compiled
-        // them to machine code and we don't need the spir-v intermediate anymore
-        device
-            .logical_device
-            .destroy_shader_module(vertex_shader_module);
-        device
-            .logical_device
-            .destroy_shader_module(fragment_shader_module);
-
-        ManuallyDrop::new(pipeline)
-    }
 }
 
 impl<B: gfx_hal::Backend> Drop for Renderer<B> {
@@ -1760,6 +1675,7 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
             for floor_uniform_buffer in self.floor_uniform_buffers.iter_mut() {
                 ManuallyDrop::drop(floor_uniform_buffer);
             }
+            ManuallyDrop::drop(&mut self.pipeline);
 
             self.device
                 .logical_device
@@ -1776,9 +1692,6 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                 .destroy_framebuffer(ManuallyDrop::take(&mut self.framebuffer));
             self.surface
                 .unconfigure_swapchain(&self.device.logical_device);
-            self.device
-                .logical_device
-                .destroy_graphics_pipeline(ManuallyDrop::take(&mut self.pipeline));
             self.device
                 .logical_device
                 .destroy_pipeline_layout(ManuallyDrop::take(&mut self.pipeline_layout));
@@ -1927,6 +1840,132 @@ fn main() {
         }
         _ => (),
     });
+}
+
+// todo: move the following functions into a memory module?
+fn copy_buffer_to_image<B: gfx_hal::Backend>(
+    device: &Rc<Device<B>>,
+    queue_group: &mut QueueGroup<B>,
+    source: &B::Buffer,
+    destination: &B::Image,
+    command_pool: &mut B::CommandPool,
+    width: u32,
+    height: u32,
+) {
+    let mut copy_fence = device
+        .logical_device
+        .create_fence(false)
+        .expect("Out of memory creating fence");
+
+    unsafe {
+        let mut command_buffer = command_pool.allocate_one(Level::Primary);
+        command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
+
+        command_buffer.copy_buffer_to_image(
+            &source,
+            &destination,
+            Layout::TransferDstOptimal,
+            iter::once(BufferImageCopy {
+                buffer_offset: 0,
+                buffer_width: width,
+                buffer_height: height,
+                image_layers: SubresourceLayers {
+                    aspects: Aspects::COLOR,
+                    level: 0,
+                    layers: 0..1,
+                },
+                image_offset: gfximg::Offset::ZERO,
+                image_extent: Extent {
+                    width: width,
+                    height: height,
+                    depth: 1,
+                },
+            }),
+        );
+        command_buffer.finish();
+        queue_group.queues[0].submit(
+            iter::once(&command_buffer),
+            iter::empty(),
+            iter::empty(),
+            Some(&mut copy_fence),
+        );
+
+        device
+            .logical_device
+            .wait_for_fence(&copy_fence, !0)
+            .unwrap();
+        command_pool.free(iter::once(command_buffer));
+        device.logical_device.destroy_fence(copy_fence);
+    }
+}
+
+/// Copies into a CPU visible buffer, undefined behavior if memory is not CPU visible!
+unsafe fn copy_into_memory<B: gfx_hal::Backend>(
+    device: &Rc<Device<B>>,
+    source: *const u8,
+    destination: &mut B::Memory,
+    len: usize,
+) {
+    let mapping = device
+        .logical_device
+        .map_memory(destination, Segment::ALL)
+        .unwrap();
+    ptr::copy_nonoverlapping(source, mapping, len);
+
+    // manually flush the memory, so that it is ensured to be available to the GPU.
+    // if instead limited buffer_memory_type to a type that contains the property
+    // memory::Properties::COHERENT, we wouldn't have to explicitly flush, possible
+    // optimization for the future.
+    // either way however, the memory is not guaranteed to be visible on the GPU yet
+    // until we submit our queue, according to the specification.
+    device
+        .logical_device
+        .flush_mapped_memory_ranges(iter::once((&*destination, Segment::ALL)))
+        .unwrap();
+
+    device.logical_device.unmap_memory(destination);
+}
+
+fn copy_buffer<B: gfx_hal::Backend>(
+    device: &Rc<Device<B>>,
+    queue_group: &mut QueueGroup<B>,
+    source: &B::Buffer,
+    destination: &B::Buffer,
+    command_pool: &mut B::CommandPool,
+    len: u64,
+) {
+    let mut copy_fence = device
+        .logical_device
+        .create_fence(false)
+        .expect("Out of memory creating fence");
+
+    unsafe {
+        let mut command_buffer = command_pool.allocate_one(Level::Primary);
+        command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
+        command_buffer.copy_buffer(
+            &*source,
+            &*destination,
+            iter::once(BufferCopy {
+                src: 0,
+                dst: 0,
+                size: len as u64,
+            }),
+        );
+        command_buffer.finish();
+        queue_group.queues[0].submit(
+            iter::once(&command_buffer),
+            iter::empty(),
+            iter::empty(),
+            Some(&mut copy_fence),
+        );
+
+        device
+            .logical_device
+            .wait_for_fence(&copy_fence, !0)
+            .unwrap();
+        command_pool.free(iter::once(command_buffer));
+        device.logical_device.destroy_fence(copy_fence);
+    }
 }
 
 // todo: this might be needed again for proper dpi handling
