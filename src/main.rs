@@ -44,7 +44,7 @@ use gfx_hal::{
     IndexType, Instance, MemoryTypeId,
 };
 
-use nalgebra::{Matrix4, Point3, Vector3};
+use nalgebra::{Matrix4, Point3, Similarity3, UnitQuaternion, Vector3};
 
 use winit::{
     dpi::LogicalSize,
@@ -67,17 +67,6 @@ struct Transformations {
     model: Matrix4<f32>,
     view: Matrix4<f32>,
     projection: Matrix4<f32>,
-}
-
-struct ModelTransform<B: gfx_hal::Backend> {
-    model: Matrix4<f32>,
-    buffer: Buffer<B>,
-}
-
-struct ViewProjectionTransform<B: gfx_hal::Backend> {
-    view: Matrix4<f32>,
-    projection: Matrix4<f32>,
-    buffer: Buffer<B>,
 }
 
 struct Buffer<B: gfx_hal::Backend> {
@@ -187,6 +176,100 @@ impl<B: gfx_hal::Backend> Image<B> {
             memory,
         }
     }
+
+    fn transition_image_layout(
+        &self,
+        queue_group: &mut QueueGroup<B>,
+        command_pool: &mut B::CommandPool,
+        format: Format,
+        layouts: Range<Layout>,
+    ) {
+        let mut command_fence = self
+            .device
+            .logical_device
+            .create_fence(false)
+            .expect("Out of memory creating fence");
+
+        let aspects = if layouts.end == Layout::DepthStencilAttachmentOptimal {
+            let mut val = Aspects::DEPTH;
+
+            if Format::is_stencil(format) {
+                val |= Aspects::STENCIL;
+            }
+            val
+        } else {
+            Aspects::COLOR
+        };
+
+        let (stages, accesses) =
+            if layouts.start == Layout::Undefined && layouts.end == Layout::TransferDstOptimal {
+                Some((
+                    PipelineStage::TOP_OF_PIPE..PipelineStage::TRANSFER,
+                    gfximg::Access::empty()..gfximg::Access::TRANSFER_WRITE,
+                ))
+            } else if layouts.start == Layout::TransferDstOptimal
+                && layouts.end == Layout::ShaderReadOnlyOptimal
+            {
+                Some((
+                    PipelineStage::TRANSFER..PipelineStage::FRAGMENT_SHADER,
+                    gfximg::Access::TRANSFER_WRITE..gfximg::Access::SHADER_READ,
+                ))
+            } else if layouts.start == Layout::Undefined
+                && layouts.end == Layout::DepthStencilAttachmentOptimal
+            {
+                Some((
+                    PipelineStage::TOP_OF_PIPE..PipelineStage::EARLY_FRAGMENT_TESTS,
+                    gfximg::Access::DEPTH_STENCIL_ATTACHMENT_READ
+                        ..gfximg::Access::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                ))
+            } else {
+                None
+            }
+            .expect(&format!(
+                "Unsupported combination of layouts {:?} and {:?}",
+                layouts.start, layouts.end
+            ));
+
+        unsafe {
+            let mut command_buffer = command_pool.allocate_one(Level::Primary);
+            command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
+            command_buffer.pipeline_barrier(
+                // our transition can happen in between any of these stages,
+                // optimally we would want this gap to be as wide as possible
+                stages.start..stages.end,
+                memory::Dependencies::empty(),
+                iter::once(memory::Barrier::Image {
+                    // our data starts with those access flags and this layout
+                    // and transitions to the latter ones in the range
+                    states: (accesses.start, layouts.start)..(accesses.end, layouts.end),
+                    target: &*self.image,
+                    range: SubresourceRange {
+                        aspects: aspects,
+                        level_start: 0,
+                        level_count: None,
+                        layer_start: 0,
+                        layer_count: None,
+                    },
+                    families: None, // used only for ownership transfer
+                }),
+            );
+
+            command_buffer.finish();
+            queue_group.queues[0].submit(
+                iter::once(&command_buffer),
+                iter::empty(),
+                iter::empty(),
+                Some(&mut command_fence),
+            );
+
+            self.device
+                .logical_device
+                .wait_for_fence(&command_fence, !0)
+                .unwrap();
+            command_pool.free(iter::once(command_buffer));
+            self.device.logical_device.destroy_fence(command_fence);
+        }
+    }
 }
 
 impl<B: gfx_hal::Backend> Drop for Image<B> {
@@ -262,16 +345,428 @@ impl<B: gfx_hal::Backend> Drop for ImageView<B> {
 }
 
 struct Material<B: gfx_hal::Backend> {
-    descriptor_sets: Vec<B::DescriptorSet>, // dependent on frames in flight
+    device: Rc<Device<B>>,
+    texture: ImageView<B>, // currently a material is only made out of a texture
+    descriptor_sets: Vec<B::DescriptorSet>, // per frame in flight, will not be freed after allocation
                                             // todo: different shader pipelines
+                                            // todo: recycle descriptor sets
 }
 
 impl<B: gfx_hal::Backend> Material<B> {
-    unsafe fn new() -> Material<B> {
-        // todo
+    pub unsafe fn new(
+        device: &Rc<Device<B>>,
+        queue_group: &mut QueueGroup<B>,
+        command_pool: &mut B::CommandPool,
+        material_descriptor_set_layout: &B::DescriptorSetLayout,
+        descriptor_pool: &mut B::DescriptorPool,
+        frames_in_flight: usize,
+        image_png: &[u8], // todo: replace this with a file path or something else and let this function load the data
+    ) -> Material<B> {
+        let image = image::load(Cursor::new(image_png), image::ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+
+        let texture = Self::create_texture(device, queue_group, command_pool, &image);
+        let descriptor_sets = Self::create_descriptor_sets(
+            device,
+            material_descriptor_set_layout,
+            descriptor_pool,
+            &texture,
+            frames_in_flight,
+        );
+
+        // todo: get image file path as param and load it into texture (imageview<b>)
         Material {
-            descriptor_sets: vec![],
+            device: device.clone(),
+            texture,
+            descriptor_sets,
         }
+    }
+
+    fn create_texture(
+        device: &Rc<Device<B>>,
+        queue_group: &mut QueueGroup<B>,
+        command_pool: &mut B::CommandPool,
+        raw_image: &image::RgbaImage,
+    ) -> ImageView<B> {
+        let buffer_len = raw_image.width() * raw_image.height() * 4;
+        let padded_buffer_len = ((buffer_len as usize + device.limits.non_coherent_atom_size - 1)
+            / device.limits.non_coherent_atom_size
+            * device.limits.non_coherent_atom_size) as u64;
+
+        let mut staging_buffer = unsafe {
+            Buffer::new(
+                device,
+                padded_buffer_len,
+                buffer::Usage::TRANSFER_SRC,
+                memory::Properties::CPU_VISIBLE,
+            )
+        };
+
+        unsafe {
+            copy_into_memory(
+                device,
+                raw_image.as_ptr(),
+                &mut staging_buffer.memory,
+                buffer_len as usize,
+            )
+        };
+
+        let texture_image = unsafe {
+            Image::new(
+                &device,
+                raw_image.width(),
+                raw_image.height(),
+                Format::Rgba8Srgb,
+                gfximg::Tiling::Optimal,
+                gfximg::Usage::TRANSFER_DST | gfximg::Usage::SAMPLED,
+                memory::Properties::DEVICE_LOCAL,
+            )
+        };
+
+        // transition to transfer destination layout
+        texture_image.transition_image_layout(
+            queue_group,
+            command_pool,
+            Format::Rgba8Srgb,
+            Layout::Undefined..Layout::TransferDstOptimal,
+        );
+
+        // copy buffer to image
+        copy_buffer_to_image(
+            device,
+            queue_group,
+            &staging_buffer.buffer,
+            &texture_image.image,
+            command_pool,
+            raw_image.width(),
+            raw_image.height(),
+        );
+
+        // transition image to shader read layout
+        texture_image.transition_image_layout(
+            queue_group,
+            command_pool,
+            Format::Rgba8Srgb,
+            Layout::TransferDstOptimal..Layout::ShaderReadOnlyOptimal,
+        );
+
+        ImageView::new(
+            device,
+            texture_image,
+            Format::Rgba8Srgb,
+            Aspects::COLOR,
+            gfximg::Usage::SAMPLED,
+        )
+    }
+
+    fn create_descriptor_sets(
+        device: &Rc<Device<B>>,
+        descriptor_set_layout: &B::DescriptorSetLayout,
+        descriptor_pool: &mut B::DescriptorPool,
+        image_view: &ImageView<B>,
+        frames_in_flight: usize,
+    ) -> Vec<B::DescriptorSet> {
+        // right now we create one descriptor set per frame in flight, even though it's not necessary yet
+        // the image view we store can be shared because it doesn't change between frames
+        let mut descriptor_sets = Vec::with_capacity(frames_in_flight);
+        let mut cloned_layouts = Vec::with_capacity(frames_in_flight);
+        for _ in 0..frames_in_flight {
+            cloned_layouts.push(&*descriptor_set_layout);
+        }
+        unsafe { descriptor_pool.allocate(cloned_layouts.into_iter(), &mut descriptor_sets) }
+            .unwrap();
+
+        for i in 0..frames_in_flight {
+            unsafe {
+                device
+                    .logical_device
+                    .write_descriptor_set(DescriptorSetWrite {
+                        set: &mut descriptor_sets[i],
+                        binding: 0,
+                        array_offset: 0,
+                        descriptors: vec![
+                            // instead of a combined image sampler, we could also use a separate image and a sampler descriptor
+                            // however, in this case we are not even using CombinedImageSampler, because the sampler is defined
+                            // immutable, therefore we only provide the image view
+                            Descriptor::Image(
+                                &*image_view.image_view,
+                                Layout::ShaderReadOnlyOptimal,
+                            ),
+                        ]
+                        .into_iter(),
+                    })
+            }
+        }
+
+        descriptor_sets
+    }
+
+    pub fn get_descriptor_set<'a>(&'a self, frame_id: usize) -> &'a B::DescriptorSet {
+        &self.descriptor_sets[frame_id]
+    }
+}
+
+struct GameObject<B: gfx_hal::Backend> {
+    device: Rc<Device<B>>,
+    transform: Similarity3<f32>,
+    vertex_buffer: Buffer<B>, // todo: make this a reference shared accross objects (mesh struct?)
+    index_buffer: Buffer<B>,  // todo: make this a reference shared accross objects (mesh struct?)
+    index_count: usize,       // todo: make this a reference shared accross objects (mesh struct?)
+    mvp_uniform_buffers: Vec<Buffer<B>>, // per frame in flight // todo: split this up, so vp part can be shared accross objects
+    mvp_descriptor_sets: Vec<B::DescriptorSet>, // per frame in flight, will not be freed after allocation, only containing mvp buffers // todo: move vp into seperate set, provided by camera instead of by every object and bind before material
+    material: Material<B>, // todo: make this a reference shared accross objects
+}
+
+impl<B: gfx_hal::Backend> GameObject<B> {
+    pub unsafe fn new(
+        device: &Rc<Device<B>>,
+        queue_group: &mut QueueGroup<B>,
+        command_pool: &mut B::CommandPool,
+        mvp_descriptor_set_layout: &B::DescriptorSetLayout,
+        descriptor_pool: &mut B::DescriptorPool,
+        frames_in_flight: usize,
+        vertices: &[Vertex],
+        indices: &[u16],
+        initial_transform: &Similarity3<f32>,
+        material: Material<B>, // todo: don't take ownership, reuse
+    ) -> GameObject<B> {
+        let vertex_buffer = Self::create_vertex_buffer(device, queue_group, command_pool, vertices);
+        let index_buffer = Self::create_index_buffer(device, queue_group, command_pool, indices);
+        let mvp_uniform_buffers = Self::create_uniform_buffers(device, frames_in_flight);
+        let mvp_descriptor_sets = Self::create_descriptor_sets(
+            device,
+            mvp_descriptor_set_layout,
+            descriptor_pool,
+            &mvp_uniform_buffers,
+            frames_in_flight,
+        );
+
+        GameObject {
+            device: device.clone(),
+            transform: initial_transform.clone(),
+            vertex_buffer,
+            index_buffer,
+            index_count: indices.len(),
+            mvp_uniform_buffers,
+            mvp_descriptor_sets,
+            material,
+        }
+    }
+
+    fn create_vertex_buffer(
+        device: &Rc<Device<B>>,
+        queue_group: &mut QueueGroup<B>,
+        command_pool: &mut B::CommandPool,
+        vertices: &[Vertex],
+    ) -> Buffer<B> {
+        let buffer_stride = size_of::<Vertex>();
+        let buffer_len = vertices.len() * buffer_stride;
+        // buffer needs to have size that's a multiple of non_coherent_atom_size for it to be mapped
+        let padded_buffer_len = ((buffer_len + device.limits.non_coherent_atom_size - 1)
+            / device.limits.non_coherent_atom_size
+            * device.limits.non_coherent_atom_size) as u64;
+
+        let mut staging_buffer = unsafe {
+            Buffer::new(
+                device,
+                padded_buffer_len,
+                buffer::Usage::TRANSFER_SRC,
+                memory::Properties::CPU_VISIBLE,
+            )
+        };
+
+        // copy data into staging buffer
+        unsafe {
+            copy_into_memory(
+                device,
+                vertices.as_ptr() as *const u8,
+                &mut staging_buffer.memory,
+                buffer_len,
+            )
+        };
+
+        let buffer = unsafe {
+            Buffer::new(
+                device,
+                buffer_len as u64,
+                buffer::Usage::TRANSFER_DST | buffer::Usage::VERTEX,
+                memory::Properties::DEVICE_LOCAL,
+            )
+        };
+
+        // copy staging buffer into final buffer
+        copy_buffer(
+            device,
+            queue_group,
+            &staging_buffer.buffer,
+            &buffer.buffer,
+            command_pool,
+            buffer_len as u64,
+        );
+
+        buffer
+    }
+
+    fn create_index_buffer(
+        device: &Rc<Device<B>>,
+        queue_group: &mut QueueGroup<B>,
+        command_pool: &mut B::CommandPool,
+        indices: &[u16],
+    ) -> Buffer<B> {
+        let buffer_stride = size_of::<u16>();
+        let buffer_len = indices.len() * buffer_stride;
+        let padded_buffer_len = ((buffer_len + device.limits.non_coherent_atom_size - 1)
+            / device.limits.non_coherent_atom_size
+            * device.limits.non_coherent_atom_size) as u64;
+
+        let mut staging_buffer = unsafe {
+            Buffer::new(
+                device,
+                padded_buffer_len,
+                buffer::Usage::TRANSFER_SRC,
+                memory::Properties::CPU_VISIBLE,
+            )
+        };
+
+        unsafe {
+            copy_into_memory(
+                device,
+                indices.as_ptr() as *const u8,
+                &mut staging_buffer.memory,
+                buffer_len,
+            )
+        };
+
+        let buffer = unsafe {
+            Buffer::new(
+                device,
+                buffer_len as u64,
+                buffer::Usage::TRANSFER_DST | buffer::Usage::INDEX,
+                memory::Properties::DEVICE_LOCAL,
+            )
+        };
+
+        copy_buffer(
+            device,
+            queue_group,
+            &staging_buffer.buffer,
+            &buffer.buffer,
+            command_pool,
+            buffer_len as u64,
+        );
+
+        buffer
+    }
+
+    fn create_uniform_buffers(device: &Rc<Device<B>>, frames_in_flight: usize) -> Vec<Buffer<B>> {
+        let mut uniform_buffers = Vec::with_capacity(frames_in_flight);
+        let padded_length = ((size_of::<Transformations>() + device.limits.non_coherent_atom_size
+            - 1)
+            / device.limits.non_coherent_atom_size
+            * device.limits.non_coherent_atom_size) as u64;
+        for _ in 0..frames_in_flight {
+            uniform_buffers.push(unsafe {
+                Buffer::new(
+                    device,
+                    padded_length,
+                    buffer::Usage::UNIFORM,
+                    memory::Properties::CPU_VISIBLE,
+                )
+            });
+        }
+
+        uniform_buffers
+    }
+
+    fn create_descriptor_sets(
+        device: &Rc<Device<B>>,
+        descriptor_set_layout: &B::DescriptorSetLayout,
+        descriptor_pool: &mut B::DescriptorPool,
+        uniform_buffers: &[Buffer<B>],
+        frames_in_flight: usize,
+    ) -> Vec<B::DescriptorSet> {
+        let mut descriptor_sets = Vec::with_capacity(frames_in_flight);
+        let mut cloned_layouts = Vec::with_capacity(frames_in_flight);
+        for _ in 0..frames_in_flight {
+            cloned_layouts.push(&*descriptor_set_layout);
+        }
+        unsafe { descriptor_pool.allocate(cloned_layouts.into_iter(), &mut descriptor_sets) }
+            .unwrap();
+
+        for i in 0..frames_in_flight {
+            unsafe {
+                device
+                    .logical_device
+                    .write_descriptor_set(DescriptorSetWrite {
+                        set: &mut descriptor_sets[i],
+                        binding: 0,
+                        array_offset: 0,
+                        descriptors: vec![Descriptor::Buffer(
+                            &*uniform_buffers[i].buffer,
+                            SubRange::WHOLE,
+                        )]
+                        .into_iter(),
+                    })
+            }
+        }
+
+        descriptor_sets
+    }
+
+    pub fn get_transform(&mut self) -> &mut Similarity3<f32> {
+        &mut self.transform
+    }
+
+    /// Copies buffers and records a draw call for this object.
+    ///
+    /// # Safety
+    ///
+    /// - `pipeline_layout` must be compatible with this object's descriptor sets.
+    pub unsafe fn draw(
+        &mut self,
+        command_buffer: &mut B::CommandBuffer,
+        pipeline_layout: &B::PipelineLayout,
+        camera_view: &Matrix4<f32>,
+        camera_projection: &Matrix4<f32>,
+        frame_id: usize,
+    ) {
+        // copy uniform buffers
+        let transformations = Transformations {
+            model: self.transform.to_homogeneous(),
+            view: camera_view.clone(),
+            projection: camera_projection.clone(),
+        };
+        copy_into_memory(
+            &self.device,
+            &transformations as *const Transformations as *const u8,
+            &mut self.mvp_uniform_buffers[frame_id].memory,
+            size_of::<Transformations>(),
+        );
+
+        // bind resources
+        command_buffer.bind_vertex_buffers(
+            0,
+            iter::once((&*self.vertex_buffer.buffer, SubRange::WHOLE)),
+        );
+        command_buffer.bind_index_buffer(
+            &*self.index_buffer.buffer,
+            SubRange::WHOLE,
+            IndexType::U16,
+        );
+        command_buffer.bind_graphics_descriptor_sets(
+            pipeline_layout,
+            0,
+            vec![
+                &self.mvp_descriptor_sets[frame_id],
+                self.material.get_descriptor_set(frame_id),
+            ]
+            .into_iter(),
+            iter::empty(),
+        );
+
+        // draw
+        command_buffer.draw_indexed(0..self.index_count as u32, 0, 0..1);
     }
 }
 
@@ -418,10 +913,19 @@ impl<B: gfx_hal::Backend> Pipeline<B> {
         self.viewport.rect.w = surface_extent.width as i16;
         self.viewport.rect.h = surface_extent.height as i16;
     }
+
+    pub unsafe fn bind(&self, command_buffer: &mut B::CommandBuffer) {
+        // viewports and scissors are part of the command buffer, known as dynamic viewports and scissors in vulkan
+        command_buffer.set_viewports(0, iter::once(self.viewport.clone()));
+        command_buffer.set_scissors(0, iter::once(self.viewport.rect));
+        command_buffer.bind_graphics_pipeline(&self.pipeline);
+    }
 }
 
 impl<B: gfx_hal::Backend> Drop for Pipeline<B> {
     fn drop(&mut self) {
+        // wait for device to become idle
+        self.device.logical_device.wait_idle().unwrap();
         unsafe {
             self.device
                 .logical_device
@@ -430,7 +934,6 @@ impl<B: gfx_hal::Backend> Drop for Pipeline<B> {
     }
 }
 
-// todo: where to put descriptor pools?
 struct FrameResources<B: gfx_hal::Backend> {
     device: Rc<Device<B>>,
     submission_complete_semaphore: ManuallyDrop<B::Semaphore>,
@@ -584,12 +1087,12 @@ struct Renderer<B: gfx_hal::Backend> {
     //command_buffers: Vec<B::CommandBuffer>,
     //texture_image_view: ManuallyDrop<B::ImageView>,
     //depth_image_views: Vec<ImageView<B>>,
-    vertex_buffer: ManuallyDrop<Buffer<B>>, // todo: consider not wrapping my types in manuallydrop and using automatic drop order
-    index_buffer: ManuallyDrop<Buffer<B>>,
-    uniform_buffers: Vec<ManuallyDrop<Buffer<B>>>,
-    floor_vertex_buffer: ManuallyDrop<Buffer<B>>,
-    floor_index_buffer: ManuallyDrop<Buffer<B>>,
-    floor_uniform_buffers: Vec<ManuallyDrop<Buffer<B>>>,
+    //vertex_buffer: ManuallyDrop<Buffer<B>>, // todo: consider not wrapping my types in manuallydrop and using automatic drop order
+    //index_buffer: ManuallyDrop<Buffer<B>>,
+    //uniform_buffers: Vec<ManuallyDrop<Buffer<B>>>,
+    //floor_vertex_buffer: ManuallyDrop<Buffer<B>>,
+    //floor_index_buffer: ManuallyDrop<Buffer<B>>,
+    //floor_uniform_buffers: Vec<ManuallyDrop<Buffer<B>>>,
     //vertex_buffer: ManuallyDrop<B::Buffer>,
     //index_buffer: ManuallyDrop<B::Buffer>,
     //uniform_buffers: Vec<ManuallyDrop<B::Buffer>>,
@@ -599,7 +1102,7 @@ struct Renderer<B: gfx_hal::Backend> {
     //texture_image: ManuallyDrop<B::Image>,
     frame_resources: Vec<FrameResources<B>>,
     texture_sampler: ManuallyDrop<B::Sampler>,
-    textures: Vec<ImageView<B>>, // Vec can be cleared to drop elements, no ManuallyDrop required
+    //textures: Vec<ImageView<B>>, // Vec can be cleared to drop elements, no ManuallyDrop required
     //depth_image: ManuallyDrop<B::Image>, //todo: per frame in flight
     //vertex_buffer_memory: ManuallyDrop<B::Memory>,
     //index_buffer_memory: ManuallyDrop<B::Memory>,
@@ -609,13 +1112,17 @@ struct Renderer<B: gfx_hal::Backend> {
     //floor_uniform_buffers_memory: Vec<ManuallyDrop<B::Memory>>,
     //texture_memory: ManuallyDrop<B::Memory>,
     //depth_image_memory: ManuallyDrop<B::Memory>,
-    descriptor_set_layout: ManuallyDrop<B::DescriptorSetLayout>,
+    //descriptor_set_layout: ManuallyDrop<B::DescriptorSetLayout>,
+    mvp_descriptor_set_layout: ManuallyDrop<B::DescriptorSetLayout>, // todo: remove model from this and add it to separate ds layout in GameObject, then move this to camera perhaps
+    material_descriptor_set_layout: ManuallyDrop<B::DescriptorSetLayout>, // currently there's only one possible layout for materials (a single image)
     descriptor_pool: ManuallyDrop<B::DescriptorPool>,
-    descriptor_sets: Vec<B::DescriptorSet>,
-    floor_descriptor_sets: Vec<B::DescriptorSet>,
+    game_objects: Vec<GameObject<B>>,
+    //descriptor_sets: Vec<B::DescriptorSet>,
+    //floor_descriptor_sets: Vec<B::DescriptorSet>,
     frames_in_flight: usize,
     frame: u64,
     start_time: Instant,
+    last_frame: Instant,
     // these are dropped in the order they are declared, very important!
     // currently assuming that during drop, this is the only Rc to this device!
     // every other struct that has a handle on this device should have been dropped at this point already
@@ -676,96 +1183,91 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             });
         }
 
-        let image_ground = image::load(
-            Cursor::new(include_bytes!(
-                "../data/textures/Ground037_1K-PNG/Ground037_1K_Color.png"
-            )),
-            image::ImageFormat::Png,
-        )
-        .unwrap()
-        .to_rgba8();
-
-        let texture_ground = Self::create_texture(
-            &device,
-            &mut queue_group,
-            &mut frame_resources[0].command_pool,
-            &image_ground,
-        );
-
-        let image_planks = image::load(
-            Cursor::new(include_bytes!(
-                "../data/textures/Planks016_1K-PNG/Planks016_1K_Color.png"
-            )),
-            image::ImageFormat::Png,
-        )
-        .unwrap()
-        .to_rgba8();
-
-        let texture_planks = Self::create_texture(
-            &device,
-            &mut queue_group,
-            &mut frame_resources[0].command_pool,
-            &image_planks,
-        );
-
         let texture_sampler = Self::create_texture_sampler(&device);
-        let descriptor_set_layout = Self::create_descriptor_set_layout(&device, &texture_sampler);
-        let uniform_buffers = Self::create_uniform_buffers(&device, frames_in_flight);
-        let mut descriptor_pool = Self::create_descriptor_pool(&device, frames_in_flight);
-        let descriptor_sets = Self::create_descriptor_sets(
-            &device,
-            &descriptor_set_layout,
-            &mut descriptor_pool,
-            &uniform_buffers,
-            &texture_planks,
-            frames_in_flight,
-        );
+        let mut descriptor_pool = Self::create_descriptor_pool(&device, frames_in_flight); // todo: determine the size of the pool somehow
+                                                                                           // todo: consider adding associated functions to Material and GameObject to generate the set layout and cache it in Renderer
+                                                                                           // alternatively: create MaterialManager and GameObjectManager
+                                                                                           // these managers will cache the set layout and they will OWN all the instances of Material/GameObject
+                                                                                           // that way, Renderer can retrieve the layouts, the manager will create instances and always ensure the correct layout is used
+                                                                                           // and the manager will be able to recycle sets (command pool does not allow freeing individual sets because we don't use the necessary flag)
+                                                                                           // alteralternatively: use offsets and don't allocate so many sets: https://www.reddit.com/r/vulkan/comments/g9aeo0/struggling_with_a_descriptor_set_strategy/
+        let mvp_descriptor_set_layout = Self::create_mvp_descriptor_set_layout(&device);
+        let material_descriptor_set_layout =
+            Self::create_material_descriptor_set_layout(&device, &texture_sampler);
 
-        let render_pass = Self::create_render_pass(&device, surface_format, depth_format);
+        let material_ground = unsafe {
+            Material::new(
+                &device,
+                &mut queue_group,
+                &mut frame_resources[0].command_pool,
+                &material_descriptor_set_layout,
+                &mut descriptor_pool,
+                frames_in_flight,
+                include_bytes!("../data/textures/Ground037_1K-PNG/Ground037_1K_Color.png"),
+            )
+        };
 
-        let vertex_buffer = Self::create_vertex_buffer(
-            &device,
-            &mut queue_group,
-            &mut frame_resources[0].command_pool,
-            &CUBE_VERTICES,
-        );
+        let material_planks = unsafe {
+            Material::new(
+                &device,
+                &mut queue_group,
+                &mut frame_resources[0].command_pool,
+                &material_descriptor_set_layout,
+                &mut descriptor_pool,
+                frames_in_flight,
+                include_bytes!("../data/textures/Planks016_1K-PNG/Planks016_1K_Color.png"),
+            )
+        };
 
-        let index_buffer = Self::create_index_buffer(
-            &device,
-            &mut queue_group,
-            &mut frame_resources[0].command_pool,
-            &CUBE_INDICES,
-        );
+        let cube = unsafe {
+            GameObject::new(
+                &device,
+                &mut queue_group,
+                &mut frame_resources[0].command_pool,
+                &mvp_descriptor_set_layout,
+                &mut descriptor_pool,
+                frames_in_flight,
+                &CUBE_VERTICES,
+                &CUBE_INDICES,
+                &Similarity3::<f32>::new(Vector3::zeros(), Vector3::zeros(), 1.0),
+                material_planks,
+            )
+        };
 
-        let floor_vertex_buffer = Self::create_vertex_buffer(
-            &device,
-            &mut queue_group,
-            &mut frame_resources[0].command_pool,
-            &QUAD_VERTICES,
-        );
-        let floor_index_buffer = Self::create_index_buffer(
-            &device,
-            &mut queue_group,
-            &mut frame_resources[0].command_pool,
-            &QUAD_INDICES,
-        );
-        let floor_uniform_buffers = Self::create_uniform_buffers(&device, frames_in_flight);
-        let floor_descriptor_sets = Self::create_descriptor_sets(
-            &device,
-            &descriptor_set_layout,
-            &mut descriptor_pool,
-            &floor_uniform_buffers,
-            &texture_ground,
-            frames_in_flight,
-        );
+        let floor = unsafe {
+            GameObject::new(
+                &device,
+                &mut queue_group,
+                &mut frame_resources[0].command_pool,
+                &mvp_descriptor_set_layout,
+                &mut descriptor_pool,
+                frames_in_flight,
+                &QUAD_VERTICES,
+                &QUAD_INDICES,
+                &Similarity3::<f32>::new(
+                    Vector3::new(0.0, 110.0, 0.0),
+                    Vector3::x() * std::f32::consts::FRAC_PI_2,
+                    200.0,
+                ),
+                material_ground,
+            )
+        };
 
         // same pipeline layout can be used between pipelines
-        // similar pipeline layouts are advantagous, where the same layouts are at the same slots across layouts
+        // similar pipeline layouts are advantagous, where the same descriptor set layouts
+        // are at the same slots across layouts
         // https://developer.nvidia.com/vulkan-shader-resource-binding
         let pipeline_layout = ManuallyDrop::new(unsafe {
             device
                 .logical_device
-                .create_pipeline_layout(iter::once(&*descriptor_set_layout), iter::empty())
+                .create_pipeline_layout(
+                    vec![
+                        &*mvp_descriptor_set_layout,
+                        &*material_descriptor_set_layout,
+                    ]
+                    .into_iter(),
+                    iter::empty(),
+                )
                 .expect("Out of memory creating pipeline layout")
         });
 
@@ -778,6 +1280,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             "../target/data/shaders/03_texture_bg.frag.spv"
         )))
         .unwrap();
+
+        let render_pass = Self::create_render_pass(&device, surface_format, depth_format);
 
         let pipeline = ManuallyDrop::new(unsafe {
             Pipeline::new(
@@ -836,36 +1340,16 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             framebuffer,
             pipeline,
             pipeline_layout,
-            //submission_complete_semaphores,
-            //submission_complete_fences,
-            //command_pools,
-            //command_buffers,
-            //texture_image_view,
-            //depth_image_views,
             frame_resources,
             texture_sampler,
-            textures: vec![texture_ground, texture_planks],
-            vertex_buffer,
-            index_buffer,
-            uniform_buffers,
-            floor_vertex_buffer,
-            floor_index_buffer,
-            floor_uniform_buffers,
-            //texture_image,
-            //depth_image,
-            //index_buffer_memory,
-            //uniform_buffers_memory,
-            //floor_index_buffer_memory,
-            //floor_uniform_buffers_memory,
-            //texture_memory,
-            //depth_image_memory,
-            descriptor_set_layout,
+            mvp_descriptor_set_layout,
+            material_descriptor_set_layout,
             descriptor_pool,
-            descriptor_sets,
-            floor_descriptor_sets,
+            game_objects: vec![cube, floor],
             frames_in_flight,
             frame: 0,
             start_time: Instant::now(),
+            last_frame: Instant::now(),
             device,
             adapter,
             queue_group,
@@ -956,58 +1440,20 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             }
         };
 
-        // rotate and move model with time
-        let time = self.start_time.elapsed().as_secs_f32();
-        let model = Matrix4::<f32>::new_translation(&Vector3::<f32>::new(
-            (time * 0.5).sin() * 5.0,
-            (time * 0.7).sin() * 4.0,
-            (time * 0.8).sin() * 4.0,
-        )) * Matrix4::<f32>::from_euler_angles(0.0, -time, time);
+        // calculate delta time and update time
+        let current_time = Instant::now();
+        let delta_time = (current_time - self.last_frame).as_secs_f32();
+        self.last_frame = current_time;
 
-        let view = self.camera.get_view();
-        let projection = self.camera.get_projection();
+        // rotate and move cube with time
+        let transform = self.game_objects[0].get_transform();
+        transform.isometry.rotation = transform.isometry.rotation
+            * UnitQuaternion::from_euler_angles(0.0, -delta_time, delta_time);
 
-        let transformations = Transformations {
-            model,
-            view,
-            projection,
-        };
-
-        // copy data into uniform buffer
-        unsafe {
-            copy_into_memory(
-                &self.device,
-                &transformations as *const Transformations as *const u8,
-                &mut self.uniform_buffers[frame_id].memory,
-                size_of::<Transformations>(),
-            )
-        };
-
-        let command_buffer = &mut *frame_resources.command_buffer;
+        let mut command_buffer = &mut *frame_resources.command_buffer;
         unsafe {
             command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
-
-            // viewports and scissors are part of the command buffer, known as dynamic viewports and scissors in vulkan
-            // todo: make own function in pipeline impl
-            command_buffer.set_viewports(0, iter::once(self.pipeline.viewport.clone()));
-            command_buffer.set_scissors(0, iter::once(self.pipeline.viewport.rect));
-            command_buffer.bind_graphics_pipeline(&self.pipeline.pipeline);
-
-            command_buffer.bind_vertex_buffers(
-                0,
-                iter::once((&*self.vertex_buffer.buffer, SubRange::WHOLE)),
-            );
-            command_buffer.bind_index_buffer(
-                &*self.index_buffer.buffer,
-                SubRange::WHOLE,
-                IndexType::U16,
-            );
-            command_buffer.bind_graphics_descriptor_sets(
-                &self.pipeline_layout,
-                0,
-                iter::once(&self.descriptor_sets[frame_id]),
-                iter::empty(),
-            );
+            self.pipeline.bind(&mut command_buffer);
 
             command_buffer.begin_render_pass(
                 &self.render_pass,
@@ -1036,44 +1482,18 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 .into_iter(),
                 SubpassContents::Inline,
             );
-            command_buffer.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..1);
-            // render a second model, the floor
-            {
-                let model = Matrix4::<f32>::new_translation(&Vector3::new(0.0, 110.0, 0.0))
-                    * Matrix4::<f32>::from_euler_angles(std::f32::consts::PI / 2.0, 0.0, 0.0)
-                    * Matrix4::<f32>::new_scaling(200.0);
 
-                // TODO: create a global descriptor set with view and projection and one model specific set for every model each
-                let transformations = Transformations {
-                    model,
-                    view,
-                    projection,
-                };
-
-                copy_into_memory(
-                    &self.device,
-                    &transformations as *const Transformations as *const u8,
-                    &mut self.floor_uniform_buffers[frame_id].memory,
-                    size_of::<Transformations>(),
-                );
-
-                command_buffer.bind_vertex_buffers(
-                    0,
-                    iter::once((&*self.floor_vertex_buffer.buffer, SubRange::WHOLE)),
-                );
-                command_buffer.bind_index_buffer(
-                    &*self.floor_index_buffer.buffer,
-                    SubRange::WHOLE,
-                    IndexType::U16,
-                );
-                command_buffer.bind_graphics_descriptor_sets(
+            // draw all objects
+            let view = self.camera.get_view();
+            let projection = self.camera.get_projection();
+            for game_object in &mut self.game_objects {
+                game_object.draw(
+                    command_buffer,
                     &self.pipeline_layout,
-                    0,
-                    iter::once(&self.floor_descriptor_sets[frame_id]),
-                    iter::empty(),
-                );
-
-                command_buffer.draw_indexed(0..QUAD_INDICES.len() as u32, 0, 0..1);
+                    &view,
+                    &projection,
+                    frame_id,
+                )
             }
 
             command_buffer.end_render_pass();
@@ -1164,235 +1584,48 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         .expect("Couldn't finad a compatible depth format.")
     }
 
-    fn transition_image_layout(
+    fn create_mvp_descriptor_set_layout(
         device: &Rc<Device<B>>,
-        queue_group: &mut QueueGroup<B>,
-        command_pool: &mut B::CommandPool,
-        image: &B::Image,
-        format: Format,
-        layouts: Range<Layout>,
-    ) {
-        let mut command_fence = device
-            .logical_device
-            .create_fence(false)
-            .expect("Out of memory creating fence");
-
-        let aspects = if layouts.end == Layout::DepthStencilAttachmentOptimal {
-            let mut val = Aspects::DEPTH;
-
-            if Format::is_stencil(format) {
-                val |= Aspects::STENCIL;
+    ) -> ManuallyDrop<B::DescriptorSetLayout> {
+        ManuallyDrop::new(
+            unsafe {
+                device.logical_device.create_descriptor_set_layout(
+                    vec![DescriptorSetLayoutBinding {
+                        binding: 0,
+                        ty: DescriptorType::Buffer {
+                            ty: BufferDescriptorType::Uniform,
+                            format: BufferDescriptorFormat::Structured {
+                                dynamic_offset: false,
+                            },
+                        },
+                        count: 1,
+                        stage_flags: ShaderStageFlags::VERTEX,
+                        immutable_samplers: false,
+                    }]
+                    .into_iter(),
+                    iter::empty(),
+                )
             }
-            val
-        } else {
-            Aspects::COLOR
-        };
-
-        let (stages, accesses) =
-            if layouts.start == Layout::Undefined && layouts.end == Layout::TransferDstOptimal {
-                Some((
-                    PipelineStage::TOP_OF_PIPE..PipelineStage::TRANSFER,
-                    gfximg::Access::empty()..gfximg::Access::TRANSFER_WRITE,
-                ))
-            } else if layouts.start == Layout::TransferDstOptimal
-                && layouts.end == Layout::ShaderReadOnlyOptimal
-            {
-                Some((
-                    PipelineStage::TRANSFER..PipelineStage::FRAGMENT_SHADER,
-                    gfximg::Access::TRANSFER_WRITE..gfximg::Access::SHADER_READ,
-                ))
-            } else if layouts.start == Layout::Undefined
-                && layouts.end == Layout::DepthStencilAttachmentOptimal
-            {
-                Some((
-                    PipelineStage::TOP_OF_PIPE..PipelineStage::EARLY_FRAGMENT_TESTS,
-                    gfximg::Access::DEPTH_STENCIL_ATTACHMENT_READ
-                        ..gfximg::Access::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                ))
-            } else {
-                None
-            }
-            .expect(&format!(
-                "Unsupported combination of layouts {:?} and {:?}",
-                layouts.start, layouts.end
-            ));
-
-        unsafe {
-            let mut command_buffer = command_pool.allocate_one(Level::Primary);
-            command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
-            command_buffer.pipeline_barrier(
-                // our transition can happen in between any of these stages,
-                // optimally we would want this gap to be as wide as possible
-                stages.start..stages.end,
-                memory::Dependencies::empty(),
-                iter::once(memory::Barrier::Image {
-                    // our data starts with those access flags and this layout
-                    // and transitions to the latter ones in the range
-                    states: (accesses.start, layouts.start)..(accesses.end, layouts.end),
-                    target: image,
-                    range: SubresourceRange {
-                        aspects: aspects,
-                        level_start: 0,
-                        level_count: None,
-                        layer_start: 0,
-                        layer_count: None,
-                    },
-                    families: None, // used only for ownership transfer
-                }),
-            );
-
-            command_buffer.finish();
-            queue_group.queues[0].submit(
-                iter::once(&command_buffer),
-                iter::empty(),
-                iter::empty(),
-                Some(&mut command_fence),
-            );
-
-            device
-                .logical_device
-                .wait_for_fence(&command_fence, !0)
-                .unwrap();
-            command_pool.free(iter::once(command_buffer));
-            device.logical_device.destroy_fence(command_fence);
-        }
+            .expect("Out of memory creating descriptor set layout"),
+        )
     }
 
-    fn create_vertex_buffer(
-        device: &Rc<Device<B>>,
-        queue_group: &mut QueueGroup<B>,
-        command_pool: &mut B::CommandPool,
-        vertices: &[Vertex],
-    ) -> ManuallyDrop<Buffer<B>> {
-        let buffer_stride = size_of::<Vertex>();
-        let buffer_len = vertices.len() * buffer_stride;
-        // buffer needs to have size that's a multiple of non_coherent_atom_size for it to be mapped
-        let padded_buffer_len = ((buffer_len + device.limits.non_coherent_atom_size - 1)
-            / device.limits.non_coherent_atom_size
-            * device.limits.non_coherent_atom_size) as u64;
-
-        let mut staging_buffer = unsafe {
-            Buffer::new(
-                device,
-                padded_buffer_len,
-                buffer::Usage::TRANSFER_SRC,
-                memory::Properties::CPU_VISIBLE,
-            )
-        };
-
-        // copy data into staging buffer
-        unsafe {
-            copy_into_memory(
-                device,
-                vertices.as_ptr() as *const u8,
-                &mut staging_buffer.memory,
-                buffer_len,
-            )
-        };
-
-        let buffer = unsafe {
-            Buffer::new(
-                device,
-                buffer_len as u64,
-                buffer::Usage::TRANSFER_DST | buffer::Usage::VERTEX,
-                memory::Properties::DEVICE_LOCAL,
-            )
-        };
-
-        // copy staging buffer into final buffer
-        copy_buffer(
-            device,
-            queue_group,
-            &staging_buffer.buffer,
-            &buffer.buffer,
-            command_pool,
-            buffer_len as u64,
-        );
-
-        ManuallyDrop::new(buffer)
-    }
-
-    fn create_index_buffer(
-        device: &Rc<Device<B>>,
-        queue_group: &mut QueueGroup<B>,
-        command_pool: &mut B::CommandPool,
-        indices: &[u16],
-    ) -> ManuallyDrop<Buffer<B>> {
-        let buffer_stride = size_of::<u16>();
-        let buffer_len = indices.len() * buffer_stride;
-        let padded_buffer_len = ((buffer_len + device.limits.non_coherent_atom_size - 1)
-            / device.limits.non_coherent_atom_size
-            * device.limits.non_coherent_atom_size) as u64;
-
-        let mut staging_buffer = unsafe {
-            Buffer::new(
-                device,
-                padded_buffer_len,
-                buffer::Usage::TRANSFER_SRC,
-                memory::Properties::CPU_VISIBLE,
-            )
-        };
-
-        unsafe {
-            copy_into_memory(
-                device,
-                indices.as_ptr() as *const u8,
-                &mut staging_buffer.memory,
-                buffer_len,
-            )
-        };
-
-        let buffer = unsafe {
-            Buffer::new(
-                device,
-                buffer_len as u64,
-                buffer::Usage::TRANSFER_DST | buffer::Usage::INDEX,
-                memory::Properties::DEVICE_LOCAL,
-            )
-        };
-
-        copy_buffer(
-            device,
-            queue_group,
-            &staging_buffer.buffer,
-            &buffer.buffer,
-            command_pool,
-            buffer_len as u64,
-        );
-
-        ManuallyDrop::new(buffer)
-    }
-
-    fn create_descriptor_set_layout(
+    fn create_material_descriptor_set_layout(
         device: &Rc<Device<B>>,
         sampler: &B::Sampler,
     ) -> ManuallyDrop<B::DescriptorSetLayout> {
         ManuallyDrop::new(
             unsafe {
                 device.logical_device.create_descriptor_set_layout(
-                    vec![
-                        DescriptorSetLayoutBinding {
-                            binding: 0,
-                            ty: DescriptorType::Buffer {
-                                ty: BufferDescriptorType::Uniform,
-                                format: BufferDescriptorFormat::Structured {
-                                    dynamic_offset: false,
-                                },
-                            },
-                            count: 1,
-                            stage_flags: ShaderStageFlags::VERTEX,
-                            immutable_samplers: false,
+                    vec![DescriptorSetLayoutBinding {
+                        binding: 0,
+                        ty: DescriptorType::Image {
+                            ty: ImageDescriptorType::Sampled { with_sampler: true },
                         },
-                        DescriptorSetLayoutBinding {
-                            binding: 1,
-                            ty: DescriptorType::Image {
-                                ty: ImageDescriptorType::Sampled { with_sampler: true },
-                            },
-                            count: 1,
-                            stage_flags: ShaderStageFlags::FRAGMENT,
-                            immutable_samplers: true,
-                        },
-                    ]
+                        count: 1,
+                        stage_flags: ShaderStageFlags::FRAGMENT,
+                        immutable_samplers: true,
+                    }]
                     .into_iter(),
                     iter::once(sampler),
                 )
@@ -1401,40 +1634,14 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         )
     }
 
-    fn create_uniform_buffers(
-        device: &Rc<Device<B>>,
-        frames_in_flight: usize,
-    ) -> Vec<ManuallyDrop<Buffer<B>>> {
-        let mut uniform_buffers = Vec::with_capacity(frames_in_flight);
-        let padded_length = ((size_of::<Transformations>() + device.limits.non_coherent_atom_size
-            - 1)
-            / device.limits.non_coherent_atom_size
-            * device.limits.non_coherent_atom_size) as u64;
-        for _ in 0..frames_in_flight {
-            let uniform_buffer = unsafe {
-                Buffer::new(
-                    device,
-                    padded_length,
-                    buffer::Usage::UNIFORM,
-                    memory::Properties::CPU_VISIBLE,
-                )
-            };
-            uniform_buffers.push(ManuallyDrop::new(uniform_buffer));
-        }
-
-        uniform_buffers
-    }
-
     fn create_descriptor_pool(
         device: &Rc<Device<B>>,
         frames_in_flight: usize,
     ) -> ManuallyDrop<B::DescriptorPool> {
-        // max_sets and count are only equal because every descriptor set contains one of each descriptor at the moment
-        // this can change in the future and does not have to be equal
         ManuallyDrop::new(
             unsafe {
                 device.logical_device.create_descriptor_pool(
-                    frames_in_flight * 2, // total amount of sets we will allocate // todo: make nice
+                    frames_in_flight * 2 * 2, // total amount of sets we will allocate // todo: determine size in a more elegant way?
                     vec![
                         DescriptorRangeDesc {
                             ty: DescriptorType::Buffer {
@@ -1458,129 +1665,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 )
             }
             .expect("Out of memory creating descriptor pool"),
-        )
-    }
-
-    fn create_descriptor_sets(
-        device: &Rc<Device<B>>,
-        descriptor_set_layout: &B::DescriptorSetLayout,
-        descriptor_pool: &mut B::DescriptorPool,
-        uniform_buffers: &[ManuallyDrop<Buffer<B>>],
-        image_view: &ImageView<B>,
-        frames_in_flight: usize,
-    ) -> Vec<B::DescriptorSet> {
-        let mut descriptor_sets = Vec::with_capacity(frames_in_flight);
-        let mut cloned_layouts = Vec::with_capacity(frames_in_flight);
-        for _ in 0..frames_in_flight {
-            cloned_layouts.push(&*descriptor_set_layout);
-        }
-        unsafe { descriptor_pool.allocate(cloned_layouts.into_iter(), &mut descriptor_sets) }
-            .unwrap();
-
-        for i in 0..frames_in_flight {
-            unsafe {
-                device
-                    .logical_device
-                    .write_descriptor_set(DescriptorSetWrite {
-                        set: &mut descriptor_sets[i],
-                        binding: 0,
-                        array_offset: 0,
-                        descriptors: vec![
-                            Descriptor::Buffer(&*uniform_buffers[i].buffer, SubRange::WHOLE),
-                            // instead of a combined image sampler, we could also use a separate image and a sampler descriptor
-                            // however, in this case we are not even using CombinedImageSampler, because the sampler is defined
-                            // immutable, therefore we only provide the image view
-                            Descriptor::Image(
-                                &*image_view.image_view,
-                                Layout::ShaderReadOnlyOptimal,
-                            ),
-                        ]
-                        .into_iter(),
-                    })
-            }
-        }
-
-        descriptor_sets
-    }
-
-    fn create_texture(
-        device: &Rc<Device<B>>,
-        queue_group: &mut QueueGroup<B>,
-        command_pool: &mut B::CommandPool,
-        raw_image: &image::RgbaImage,
-    ) -> ImageView<B> {
-        let buffer_len = raw_image.width() * raw_image.height() * 4;
-        let padded_buffer_len = ((buffer_len as usize + device.limits.non_coherent_atom_size - 1)
-            / device.limits.non_coherent_atom_size
-            * device.limits.non_coherent_atom_size) as u64;
-
-        let mut staging_buffer = unsafe {
-            Buffer::new(
-                device,
-                padded_buffer_len,
-                buffer::Usage::TRANSFER_SRC,
-                memory::Properties::CPU_VISIBLE,
-            )
-        };
-
-        unsafe {
-            copy_into_memory(
-                device,
-                raw_image.as_ptr(),
-                &mut staging_buffer.memory,
-                buffer_len as usize,
-            )
-        };
-
-        let texture_image = unsafe {
-            Image::new(
-                &device,
-                raw_image.width(),
-                raw_image.height(),
-                Format::Rgba8Srgb,
-                gfximg::Tiling::Optimal,
-                gfximg::Usage::TRANSFER_DST | gfximg::Usage::SAMPLED,
-                memory::Properties::DEVICE_LOCAL,
-            )
-        };
-
-        // transition to transfer destination layout
-        Self::transition_image_layout(
-            device,
-            queue_group,
-            command_pool,
-            &texture_image.image,
-            Format::Rgba8Srgb,
-            Layout::Undefined..Layout::TransferDstOptimal,
-        );
-
-        // copy buffer to image
-        copy_buffer_to_image(
-            device,
-            queue_group,
-            &staging_buffer.buffer,
-            &texture_image.image,
-            command_pool,
-            raw_image.width(),
-            raw_image.height(),
-        );
-
-        // transition image to shader read layout
-        Self::transition_image_layout(
-            device,
-            queue_group,
-            command_pool,
-            &texture_image.image,
-            Format::Rgba8Srgb,
-            Layout::TransferDstOptimal..Layout::ShaderReadOnlyOptimal,
-        );
-
-        ImageView::new(
-            device,
-            texture_image,
-            Format::Rgba8Srgb,
-            Aspects::COLOR,
-            gfximg::Usage::SAMPLED,
         )
     }
 
@@ -1663,18 +1747,8 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                 .logical_device
                 .destroy_sampler(ManuallyDrop::take(&mut self.texture_sampler));
 
-            // drop images and buffers
-            self.textures.clear();
-            ManuallyDrop::drop(&mut self.vertex_buffer);
-            ManuallyDrop::drop(&mut self.floor_vertex_buffer);
-            ManuallyDrop::drop(&mut self.index_buffer);
-            ManuallyDrop::drop(&mut self.floor_index_buffer);
-            for uniform_buffer in self.uniform_buffers.iter_mut() {
-                ManuallyDrop::drop(uniform_buffer);
-            }
-            for floor_uniform_buffer in self.floor_uniform_buffers.iter_mut() {
-                ManuallyDrop::drop(floor_uniform_buffer);
-            }
+            // drop game objects
+            self.game_objects.clear();
             ManuallyDrop::drop(&mut self.pipeline);
 
             self.device
@@ -1682,7 +1756,14 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
                 .destroy_descriptor_pool(ManuallyDrop::take(&mut self.descriptor_pool));
             self.device
                 .logical_device
-                .destroy_descriptor_set_layout(ManuallyDrop::take(&mut self.descriptor_set_layout));
+                .destroy_descriptor_set_layout(ManuallyDrop::take(
+                    &mut self.mvp_descriptor_set_layout,
+                ));
+            self.device
+                .logical_device
+                .destroy_descriptor_set_layout(ManuallyDrop::take(
+                    &mut self.material_descriptor_set_layout,
+                ));
 
             self.device
                 .logical_device
@@ -1906,6 +1987,7 @@ unsafe fn copy_into_memory<B: gfx_hal::Backend>(
     destination: &mut B::Memory,
     len: usize,
 ) {
+    // todo: consider keeping the memory mapped for uniform buffers
     let mapping = device
         .logical_device
         .map_memory(destination, Segment::ALL)

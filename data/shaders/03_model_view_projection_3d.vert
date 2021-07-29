@@ -1,6 +1,6 @@
 #version 450
 
-layout(binding = 0) uniform Transformations {
+layout(set = 0, binding = 0) uniform Transformations {
     mat4 model;
     mat4 view;
     mat4 projection;
