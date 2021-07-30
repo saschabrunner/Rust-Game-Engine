@@ -1,4 +1,7 @@
 mod camera;
+mod device;
+
+use device::Device;
 
 use std::{
     borrow::Borrow,
@@ -12,7 +15,7 @@ use std::{
 };
 
 use gfx_hal::{
-    adapter::{Adapter, MemoryType, PhysicalDevice},
+    adapter::{Adapter, PhysicalDevice},
     buffer::{self, SubRange},
     command::{
         BufferCopy, BufferImageCopy, ClearColor, ClearDepthStencil, ClearValue, CommandBuffer,
@@ -24,7 +27,7 @@ use gfx_hal::{
         self as gfximg, Extent, FramebufferAttachment, Layout, SamplerDesc, SubresourceLayers,
         SubresourceRange, ViewCapabilities, ViewKind,
     },
-    memory::{self, Segment, SparseFlags},
+    memory::{self as gfx_mem, Segment, SparseFlags},
     pass::{
         Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, Subpass, SubpassDependency,
         SubpassDesc,
@@ -39,9 +42,9 @@ use gfx_hal::{
         Rasterizer, Rect, ShaderStageFlags, Specialization, VertexBufferDesc, VertexInputRate,
         Viewport,
     },
-    queue::{family::QueueFamilyId, Queue, QueueFamily, QueueGroup},
+    queue::{family::QueueFamilyId, Queue, QueueGroup},
     window::{Extent2D, PresentationSurface, Surface, SwapchainConfig},
-    IndexType, Instance, MemoryTypeId,
+    IndexType, Instance,
 };
 
 use nalgebra::{Matrix4, Point3, Similarity3, UnitQuaternion, Vector3};
@@ -80,25 +83,25 @@ impl<B: gfx_hal::Backend> Buffer<B> {
         device: &Rc<Device<B>>,
         buffer_len: u64,
         usage: buffer::Usage,
-        properties: memory::Properties,
+        properties: gfx_mem::Properties,
     ) -> Self {
         let mut buffer = ManuallyDrop::new(
             device
-                .logical_device
+                .logical_device()
                 .create_buffer(buffer_len, usage, SparseFlags::empty())
                 .unwrap(),
         );
 
-        let buffer_requirements = device.logical_device.get_buffer_requirements(&buffer);
+        let buffer_requirements = device.logical_device().get_buffer_requirements(&buffer);
 
         let buffer_memory_type = device.find_memory_type(buffer_requirements.type_mask, properties);
 
         let memory = device
-            .logical_device
+            .logical_device()
             .allocate_memory(buffer_memory_type, buffer_requirements.size)
             .unwrap();
         device
-            .logical_device
+            .logical_device()
             .bind_buffer_memory(&memory, 0, &mut buffer)
             .unwrap();
         let memory = ManuallyDrop::new(memory);
@@ -114,14 +117,14 @@ impl<B: gfx_hal::Backend> Buffer<B> {
 impl<B: gfx_hal::Backend> Drop for Buffer<B> {
     fn drop(&mut self) {
         // wait for device to become idle
-        self.device.logical_device.wait_idle().unwrap();
+        self.device.logical_device().wait_idle().unwrap();
 
         unsafe {
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_buffer(ManuallyDrop::take(&mut self.buffer));
             self.device
-                .logical_device
+                .logical_device()
                 .free_memory(ManuallyDrop::take(&mut self.memory));
         }
     }
@@ -141,11 +144,11 @@ impl<B: gfx_hal::Backend> Image<B> {
         format: Format,
         tiling: gfximg::Tiling,
         usage: gfximg::Usage,
-        properties: memory::Properties,
+        properties: gfx_mem::Properties,
     ) -> Self {
         let mut image = ManuallyDrop::new(
             device
-                .logical_device
+                .logical_device()
                 .create_image(
                     gfximg::Kind::D2(width, height, 1, 1),
                     1,
@@ -158,15 +161,15 @@ impl<B: gfx_hal::Backend> Image<B> {
                 .unwrap(),
         );
 
-        let image_requirements = device.logical_device.get_image_requirements(&image);
+        let image_requirements = device.logical_device().get_image_requirements(&image);
         let memory_type = device.find_memory_type(image_requirements.type_mask, properties);
 
         let memory = device
-            .logical_device
+            .logical_device()
             .allocate_memory(memory_type, image_requirements.size)
             .unwrap();
         device
-            .logical_device
+            .logical_device()
             .bind_image_memory(&memory, 0, &mut image)
             .unwrap();
         let memory = ManuallyDrop::new(memory);
@@ -186,7 +189,7 @@ impl<B: gfx_hal::Backend> Image<B> {
     ) {
         let mut command_fence = self
             .device
-            .logical_device
+            .logical_device()
             .create_fence(false)
             .expect("Out of memory creating fence");
 
@@ -237,8 +240,8 @@ impl<B: gfx_hal::Backend> Image<B> {
                 // our transition can happen in between any of these stages,
                 // optimally we would want this gap to be as wide as possible
                 stages.start..stages.end,
-                memory::Dependencies::empty(),
-                iter::once(memory::Barrier::Image {
+                gfx_mem::Dependencies::empty(),
+                iter::once(gfx_mem::Barrier::Image {
                     // our data starts with those access flags and this layout
                     // and transitions to the latter ones in the range
                     states: (accesses.start, layouts.start)..(accesses.end, layouts.end),
@@ -263,11 +266,11 @@ impl<B: gfx_hal::Backend> Image<B> {
             );
 
             self.device
-                .logical_device
+                .logical_device()
                 .wait_for_fence(&command_fence, !0)
                 .unwrap();
             command_pool.free(iter::once(command_buffer));
-            self.device.logical_device.destroy_fence(command_fence);
+            self.device.logical_device().destroy_fence(command_fence);
         }
     }
 }
@@ -275,14 +278,14 @@ impl<B: gfx_hal::Backend> Image<B> {
 impl<B: gfx_hal::Backend> Drop for Image<B> {
     fn drop(&mut self) {
         // wait for device to become idle
-        self.device.logical_device.wait_idle().unwrap();
+        self.device.logical_device().wait_idle().unwrap();
 
         unsafe {
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_image(ManuallyDrop::take(&mut self.image));
             self.device
-                .logical_device
+                .logical_device()
                 .free_memory(ManuallyDrop::take(&mut self.memory));
         }
     }
@@ -304,7 +307,7 @@ impl<B: gfx_hal::Backend> ImageView<B> {
     ) -> Self {
         let iv = ManuallyDrop::new(
             unsafe {
-                device.logical_device.create_image_view(
+                device.logical_device().create_image_view(
                     &image.image,
                     ViewKind::D2,
                     format,
@@ -333,11 +336,11 @@ impl<B: gfx_hal::Backend> ImageView<B> {
 impl<B: gfx_hal::Backend> Drop for ImageView<B> {
     fn drop(&mut self) {
         // wait for device to become idle
-        self.device.logical_device.wait_idle().unwrap();
+        self.device.logical_device().wait_idle().unwrap();
 
         unsafe {
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_image_view(ManuallyDrop::take(&mut self.image_view));
         }
         // drop of image will be called here
@@ -390,16 +393,16 @@ impl<B: gfx_hal::Backend> Material<B> {
         raw_image: &image::RgbaImage,
     ) -> ImageView<B> {
         let buffer_len = raw_image.width() * raw_image.height() * 4;
-        let padded_buffer_len = ((buffer_len as usize + device.limits.non_coherent_atom_size - 1)
-            / device.limits.non_coherent_atom_size
-            * device.limits.non_coherent_atom_size) as u64;
+        let padded_buffer_len = ((buffer_len as usize + device.limits().non_coherent_atom_size - 1)
+            / device.limits().non_coherent_atom_size
+            * device.limits().non_coherent_atom_size) as u64;
 
         let mut staging_buffer = unsafe {
             Buffer::new(
                 device,
                 padded_buffer_len,
                 buffer::Usage::TRANSFER_SRC,
-                memory::Properties::CPU_VISIBLE,
+                gfx_mem::Properties::CPU_VISIBLE,
             )
         };
 
@@ -420,7 +423,7 @@ impl<B: gfx_hal::Backend> Material<B> {
                 Format::Rgba8Srgb,
                 gfximg::Tiling::Optimal,
                 gfximg::Usage::TRANSFER_DST | gfximg::Usage::SAMPLED,
-                memory::Properties::DEVICE_LOCAL,
+                gfx_mem::Properties::DEVICE_LOCAL,
             )
         };
 
@@ -480,7 +483,7 @@ impl<B: gfx_hal::Backend> Material<B> {
         for i in 0..frames_in_flight {
             unsafe {
                 device
-                    .logical_device
+                    .logical_device()
                     .write_descriptor_set(DescriptorSetWrite {
                         set: &mut descriptor_sets[i],
                         binding: 0,
@@ -563,16 +566,16 @@ impl<B: gfx_hal::Backend> GameObject<B> {
         let buffer_stride = size_of::<Vertex>();
         let buffer_len = vertices.len() * buffer_stride;
         // buffer needs to have size that's a multiple of non_coherent_atom_size for it to be mapped
-        let padded_buffer_len = ((buffer_len + device.limits.non_coherent_atom_size - 1)
-            / device.limits.non_coherent_atom_size
-            * device.limits.non_coherent_atom_size) as u64;
+        let padded_buffer_len = ((buffer_len + device.limits().non_coherent_atom_size - 1)
+            / device.limits().non_coherent_atom_size
+            * device.limits().non_coherent_atom_size) as u64;
 
         let mut staging_buffer = unsafe {
             Buffer::new(
                 device,
                 padded_buffer_len,
                 buffer::Usage::TRANSFER_SRC,
-                memory::Properties::CPU_VISIBLE,
+                gfx_mem::Properties::CPU_VISIBLE,
             )
         };
 
@@ -591,7 +594,7 @@ impl<B: gfx_hal::Backend> GameObject<B> {
                 device,
                 buffer_len as u64,
                 buffer::Usage::TRANSFER_DST | buffer::Usage::VERTEX,
-                memory::Properties::DEVICE_LOCAL,
+                gfx_mem::Properties::DEVICE_LOCAL,
             )
         };
 
@@ -616,16 +619,16 @@ impl<B: gfx_hal::Backend> GameObject<B> {
     ) -> Buffer<B> {
         let buffer_stride = size_of::<u16>();
         let buffer_len = indices.len() * buffer_stride;
-        let padded_buffer_len = ((buffer_len + device.limits.non_coherent_atom_size - 1)
-            / device.limits.non_coherent_atom_size
-            * device.limits.non_coherent_atom_size) as u64;
+        let padded_buffer_len = ((buffer_len + device.limits().non_coherent_atom_size - 1)
+            / device.limits().non_coherent_atom_size
+            * device.limits().non_coherent_atom_size) as u64;
 
         let mut staging_buffer = unsafe {
             Buffer::new(
                 device,
                 padded_buffer_len,
                 buffer::Usage::TRANSFER_SRC,
-                memory::Properties::CPU_VISIBLE,
+                gfx_mem::Properties::CPU_VISIBLE,
             )
         };
 
@@ -643,7 +646,7 @@ impl<B: gfx_hal::Backend> GameObject<B> {
                 device,
                 buffer_len as u64,
                 buffer::Usage::TRANSFER_DST | buffer::Usage::INDEX,
-                memory::Properties::DEVICE_LOCAL,
+                gfx_mem::Properties::DEVICE_LOCAL,
             )
         };
 
@@ -661,17 +664,17 @@ impl<B: gfx_hal::Backend> GameObject<B> {
 
     fn create_uniform_buffers(device: &Rc<Device<B>>, frames_in_flight: usize) -> Vec<Buffer<B>> {
         let mut uniform_buffers = Vec::with_capacity(frames_in_flight);
-        let padded_length = ((size_of::<Transformations>() + device.limits.non_coherent_atom_size
-            - 1)
-            / device.limits.non_coherent_atom_size
-            * device.limits.non_coherent_atom_size) as u64;
+        let padded_length =
+            ((size_of::<Transformations>() + device.limits().non_coherent_atom_size - 1)
+                / device.limits().non_coherent_atom_size
+                * device.limits().non_coherent_atom_size) as u64;
         for _ in 0..frames_in_flight {
             uniform_buffers.push(unsafe {
                 Buffer::new(
                     device,
                     padded_length,
                     buffer::Usage::UNIFORM,
-                    memory::Properties::CPU_VISIBLE,
+                    gfx_mem::Properties::CPU_VISIBLE,
                 )
             });
         }
@@ -697,7 +700,7 @@ impl<B: gfx_hal::Backend> GameObject<B> {
         for i in 0..frames_in_flight {
             unsafe {
                 device
-                    .logical_device
+                    .logical_device()
                     .write_descriptor_set(DescriptorSetWrite {
                         set: &mut descriptor_sets[i],
                         binding: 0,
@@ -788,12 +791,12 @@ impl<B: gfx_hal::Backend> Pipeline<B> {
         surface_extent: Extent2D,
     ) -> Self {
         let vertex_shader_module = device
-            .logical_device
+            .logical_device()
             .create_shader_module(vertex_shader)
             .expect("Failed to create vertex shader module");
 
         let fragment_shader_module = device
-            .logical_device
+            .logical_device()
             .create_shader_module(fragment_shader)
             .expect("Failed to create fragment shader module");
 
@@ -878,7 +881,7 @@ impl<B: gfx_hal::Backend> Pipeline<B> {
 
         let pipeline = ManuallyDrop::new(
             device
-                .logical_device
+                .logical_device()
                 .create_graphics_pipeline(&pipeline_desc, None)
                 .expect("Failed to create graphics pipeline"),
         );
@@ -886,10 +889,10 @@ impl<B: gfx_hal::Backend> Pipeline<B> {
         // shader modules can be destroyed now, since the pipeline compiled
         // them to machine code and we don't need the spir-v intermediate anymore
         device
-            .logical_device
+            .logical_device()
             .destroy_shader_module(vertex_shader_module);
         device
-            .logical_device
+            .logical_device()
             .destroy_shader_module(fragment_shader_module);
 
         let viewport = Viewport {
@@ -925,10 +928,10 @@ impl<B: gfx_hal::Backend> Pipeline<B> {
 impl<B: gfx_hal::Backend> Drop for Pipeline<B> {
     fn drop(&mut self) {
         // wait for device to become idle
-        self.device.logical_device.wait_idle().unwrap();
+        self.device.logical_device().wait_idle().unwrap();
         unsafe {
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_graphics_pipeline(ManuallyDrop::take(&mut self.pipeline));
         }
     }
@@ -952,7 +955,7 @@ impl<B: gfx_hal::Backend> FrameResources<B> {
     ) -> Self {
         let mut command_pool = ManuallyDrop::new(
             device
-                .logical_device
+                .logical_device()
                 .create_command_pool(queue_family, CommandPoolCreateFlags::empty())
                 .expect("Out of memory creating command pool"),
         );
@@ -961,14 +964,14 @@ impl<B: gfx_hal::Backend> FrameResources<B> {
 
         let submission_complete_semaphore = ManuallyDrop::new(
             device
-                .logical_device
+                .logical_device()
                 .create_semaphore()
                 .expect("Out of memory creating semaphore"),
         );
 
         let submission_complete_fence = ManuallyDrop::new(
             device
-                .logical_device
+                .logical_device()
                 .create_fence(true)
                 .expect("Out of memory creating fence"),
         );
@@ -1002,7 +1005,7 @@ impl<B: gfx_hal::Backend> FrameResources<B> {
             depth_format,
             gfximg::Tiling::Optimal,
             gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
-            memory::Properties::DEVICE_LOCAL,
+            gfx_mem::Properties::DEVICE_LOCAL,
         );
 
         ImageView::new(
@@ -1018,53 +1021,25 @@ impl<B: gfx_hal::Backend> FrameResources<B> {
 impl<B: gfx_hal::Backend> Drop for FrameResources<B> {
     fn drop(&mut self) {
         // wait for device to become idle
-        self.device.logical_device.wait_idle().unwrap();
+        self.device.logical_device().wait_idle().unwrap();
 
         unsafe {
             self.command_pool
                 .free(iter::once(ManuallyDrop::take(&mut self.command_buffer)));
 
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_command_pool(ManuallyDrop::take(&mut self.command_pool));
 
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_semaphore(ManuallyDrop::take(&mut self.submission_complete_semaphore));
 
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_fence(ManuallyDrop::take(&mut self.submission_complete_fence));
         }
         // drop of depth_image_view will be called here
-    }
-}
-
-struct Device<B: gfx_hal::Backend> {
-    logical_device: B::Device,
-    limits: gfx_hal::Limits,
-    // in the future I might also want to consider the memory_heaps field in the memory properties
-    // this will be useful to determine wheter the type belongs to the GPUs VRAM or might be slow system RAM
-    memory_types: Vec<MemoryType>,
-}
-
-impl<B: gfx_hal::Backend> Device<B> {
-    fn find_memory_type(
-        &self,
-        requirements_type_mask: u32,
-        required_properties: memory::Properties,
-    ) -> MemoryTypeId {
-        self.memory_types
-            .iter()
-            .enumerate()
-            .position(|(id, memory_type)| {
-                // shift one bit and use bitwise and to find the first memory type that
-                // is usable and has the required properties
-                requirements_type_mask & (1 << id) != 0
-                    && memory_type.properties.contains(required_properties)
-            })
-            .unwrap()
-            .into()
     }
 }
 
@@ -1129,38 +1104,24 @@ struct Renderer<B: gfx_hal::Backend> {
     // alternatively, a global function could be created to get a more short lived reference to the device
     // then Rc wouldn't be needed at all
     device: Rc<Device<B>>,
-    adapter: Adapter<B>,
+    //adapter: Adapter<B>,
     queue_group: QueueGroup<B>,
     instance: B::Instance,
 }
 
 impl<B: gfx_hal::Backend> Renderer<B> {
     pub fn new(instance: B::Instance, mut surface: B::Surface, adapter: Adapter<B>) -> Renderer<B> {
-        let physical_device = &adapter.physical_device;
-
-        let queue_family = Self::find_queue_family(&adapter, &surface);
-
-        let mut gpu = unsafe {
-            physical_device
-                .open(&[(queue_family, &[1.0])], gfx_hal::Features::empty())
-                .expect("Failed to open device")
-        };
-
-        let device = Rc::new(Device::<B> {
-            logical_device: gpu.device,
-            limits: physical_device.properties().limits,
-            memory_types: physical_device.memory_properties().memory_types,
-        });
-        let mut queue_group = gpu.queue_groups.pop().unwrap();
-
-        let surface_format = Self::find_surface_format(physical_device, &surface);
-        let depth_format = Self::find_depth_format(physical_device);
+        let mut device = unsafe { Device::<B>::new(adapter, &surface) };
+        let mut queue_group = device.queue_groups().pop().unwrap();
+        let device = Rc::new(device); // Rc can only be created now because of mutable borrow above
+        let surface_format = Self::find_surface_format(device.physical_device(), &surface);
+        let depth_format = Self::find_depth_format(device.physical_device());
 
         let default_surface_extent = Extent2D {
             width: DEFAULT_WINDOW_SIZE[0],
             height: DEFAULT_WINDOW_SIZE[1],
         };
-        let capabilities = surface.capabilities(physical_device);
+        let capabilities = surface.capabilities(device.physical_device());
         let swapchain_config =
             SwapchainConfig::from_caps(&capabilities, surface_format, default_surface_extent);
         let framebuffer_attachment = swapchain_config.framebuffer_attachment();
@@ -1170,7 +1131,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
         unsafe {
             surface
-                .configure_swapchain(&device.logical_device, swapchain_config)
+                .configure_swapchain(device.logical_device(), swapchain_config)
                 .expect("Failed to configure swapchain");
         }
 
@@ -1259,7 +1220,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         // https://developer.nvidia.com/vulkan-shader-resource-binding
         let pipeline_layout = ManuallyDrop::new(unsafe {
             device
-                .logical_device
+                .logical_device()
                 .create_pipeline_layout(
                     vec![
                         &*mvp_descriptor_set_layout,
@@ -1309,7 +1270,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         };
         let framebuffer = ManuallyDrop::new(unsafe {
             device
-                .logical_device
+                .logical_device()
                 .create_framebuffer(
                     &render_pass,
                     vec![framebuffer_attachment, depth_attachment].into_iter(),
@@ -1351,14 +1312,13 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             start_time: Instant::now(),
             last_frame: Instant::now(),
             device,
-            adapter,
             queue_group,
             instance,
         }
     }
 
     pub fn recreate_swapchain(&mut self) {
-        let capabilities = self.surface.capabilities(&self.adapter.physical_device);
+        let capabilities = self.surface.capabilities(self.device.physical_device());
         let swapchain_config =
             SwapchainConfig::from_caps(&capabilities, self.surface_format, self.surface_extent);
 
@@ -1366,11 +1326,11 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         self.surface_extent = swapchain_config.extent;
 
         unsafe {
-            self.device.logical_device.wait_idle().unwrap();
+            self.device.logical_device().wait_idle().unwrap();
 
             // destroy resources about to be recreated
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_framebuffer(ManuallyDrop::take(&mut self.framebuffer));
 
             let depth_attachment = FramebufferAttachment {
@@ -1382,7 +1342,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             // recreate framebuffer
             self.framebuffer = ManuallyDrop::new(
                 self.device
-                    .logical_device
+                    .logical_device()
                     .create_framebuffer(
                         &self.render_pass,
                         vec![swapchain_config.framebuffer_attachment(), depth_attachment]
@@ -1394,7 +1354,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 
             // reconfigure swapchain
             self.surface
-                .configure_swapchain(&self.device.logical_device, swapchain_config)
+                .configure_swapchain(self.device.logical_device(), swapchain_config)
                 .expect("Failed to configure swapchain");
         }
 
@@ -1416,14 +1376,14 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             // wait for the previous submission to finish before resetting command pool and preparing new frame
             let render_timeout_ns = 1_000_000_000;
             self.device
-                .logical_device
+                .logical_device()
                 .wait_for_fence(
                     &frame_resources.submission_complete_fence,
                     render_timeout_ns,
                 )
                 .expect("Out of memory or device lost waiting for fence");
             self.device
-                .logical_device
+                .logical_device()
                 .reset_fence(&mut frame_resources.submission_complete_fence)
                 .expect("Out of memory resetting fence");
             frame_resources.command_pool.reset(false);
@@ -1520,16 +1480,6 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         self.frame += 1;
     }
 
-    fn find_queue_family<'a>(adapter: &'a Adapter<B>, surface: &B::Surface) -> &'a B::QueueFamily {
-        adapter
-            .queue_families
-            .iter()
-            .find(|family| {
-                surface.supports_queue_family(family) && family.queue_type().supports_graphics()
-            })
-            .expect("No compatible queue family found")
-    }
-
     fn find_surface_format(physical_device: &B::PhysicalDevice, surface: &B::Surface) -> Format {
         // get the formats that the surface and the adapter support together
         let supported_formats = surface.supported_formats(physical_device).unwrap_or(vec![]);
@@ -1589,7 +1539,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     ) -> ManuallyDrop<B::DescriptorSetLayout> {
         ManuallyDrop::new(
             unsafe {
-                device.logical_device.create_descriptor_set_layout(
+                device.logical_device().create_descriptor_set_layout(
                     vec![DescriptorSetLayoutBinding {
                         binding: 0,
                         ty: DescriptorType::Buffer {
@@ -1616,7 +1566,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     ) -> ManuallyDrop<B::DescriptorSetLayout> {
         ManuallyDrop::new(
             unsafe {
-                device.logical_device.create_descriptor_set_layout(
+                device.logical_device().create_descriptor_set_layout(
                     vec![DescriptorSetLayoutBinding {
                         binding: 0,
                         ty: DescriptorType::Image {
@@ -1640,7 +1590,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     ) -> ManuallyDrop<B::DescriptorPool> {
         ManuallyDrop::new(
             unsafe {
-                device.logical_device.create_descriptor_pool(
+                device.logical_device().create_descriptor_pool(
                     frames_in_flight * 2 * 2, // total amount of sets we will allocate // todo: determine size in a more elegant way?
                     vec![
                         DescriptorRangeDesc {
@@ -1672,7 +1622,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         // this uses no anisotropy, has to be changed if required
         ManuallyDrop::new(
             unsafe {
-                device.logical_device.create_sampler(&SamplerDesc::new(
+                device.logical_device().create_sampler(&SamplerDesc::new(
                     gfximg::Filter::Linear,
                     gfximg::WrapMode::Tile,
                 ))
@@ -1718,12 +1668,12 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             accesses: gfximg::Access::empty()
                 ..gfximg::Access::COLOR_ATTACHMENT_WRITE
                     | gfximg::Access::DEPTH_STENCIL_ATTACHMENT_WRITE,
-            flags: memory::Dependencies::empty(),
+            flags: gfx_mem::Dependencies::empty(),
         };
 
         ManuallyDrop::new(unsafe {
             device
-                .logical_device
+                .logical_device()
                 .create_render_pass(
                     vec![color_attachment, depth_attachment].into_iter(),
                     iter::once(subpass),
@@ -1737,14 +1687,14 @@ impl<B: gfx_hal::Backend> Renderer<B> {
 impl<B: gfx_hal::Backend> Drop for Renderer<B> {
     fn drop(&mut self) {
         // wait for device to become idle
-        self.device.logical_device.wait_idle().unwrap();
+        self.device.logical_device().wait_idle().unwrap();
 
         unsafe {
             // drop per frame resources
             self.frame_resources.clear();
 
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_sampler(ManuallyDrop::take(&mut self.texture_sampler));
 
             // drop game objects
@@ -1752,29 +1702,29 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
             ManuallyDrop::drop(&mut self.pipeline);
 
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_descriptor_pool(ManuallyDrop::take(&mut self.descriptor_pool));
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_descriptor_set_layout(ManuallyDrop::take(
                     &mut self.mvp_descriptor_set_layout,
                 ));
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_descriptor_set_layout(ManuallyDrop::take(
                     &mut self.material_descriptor_set_layout,
                 ));
 
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_render_pass(ManuallyDrop::take(&mut self.render_pass));
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_framebuffer(ManuallyDrop::take(&mut self.framebuffer));
             self.surface
-                .unconfigure_swapchain(&self.device.logical_device);
+                .unconfigure_swapchain(&self.device.logical_device());
             self.device
-                .logical_device
+                .logical_device()
                 .destroy_pipeline_layout(ManuallyDrop::take(&mut self.pipeline_layout));
             self.instance
                 .destroy_surface(ManuallyDrop::take(&mut self.surface));
@@ -1934,7 +1884,7 @@ fn copy_buffer_to_image<B: gfx_hal::Backend>(
     height: u32,
 ) {
     let mut copy_fence = device
-        .logical_device
+        .logical_device()
         .create_fence(false)
         .expect("Out of memory creating fence");
 
@@ -1972,11 +1922,11 @@ fn copy_buffer_to_image<B: gfx_hal::Backend>(
         );
 
         device
-            .logical_device
+            .logical_device()
             .wait_for_fence(&copy_fence, !0)
             .unwrap();
         command_pool.free(iter::once(command_buffer));
-        device.logical_device.destroy_fence(copy_fence);
+        device.logical_device().destroy_fence(copy_fence);
     }
 }
 
@@ -1989,7 +1939,7 @@ unsafe fn copy_into_memory<B: gfx_hal::Backend>(
 ) {
     // todo: consider keeping the memory mapped for uniform buffers
     let mapping = device
-        .logical_device
+        .logical_device()
         .map_memory(destination, Segment::ALL)
         .unwrap();
     ptr::copy_nonoverlapping(source, mapping, len);
@@ -2001,11 +1951,11 @@ unsafe fn copy_into_memory<B: gfx_hal::Backend>(
     // either way however, the memory is not guaranteed to be visible on the GPU yet
     // until we submit our queue, according to the specification.
     device
-        .logical_device
+        .logical_device()
         .flush_mapped_memory_ranges(iter::once((&*destination, Segment::ALL)))
         .unwrap();
 
-    device.logical_device.unmap_memory(destination);
+    device.logical_device().unmap_memory(destination);
 }
 
 fn copy_buffer<B: gfx_hal::Backend>(
@@ -2017,7 +1967,7 @@ fn copy_buffer<B: gfx_hal::Backend>(
     len: u64,
 ) {
     let mut copy_fence = device
-        .logical_device
+        .logical_device()
         .create_fence(false)
         .expect("Out of memory creating fence");
 
@@ -2042,11 +1992,11 @@ fn copy_buffer<B: gfx_hal::Backend>(
         );
 
         device
-            .logical_device
+            .logical_device()
             .wait_for_fence(&copy_fence, !0)
             .unwrap();
         command_pool.free(iter::once(command_buffer));
-        device.logical_device.destroy_fence(copy_fence);
+        device.logical_device().destroy_fence(copy_fence);
     }
 }
 
