@@ -1,5 +1,6 @@
 mod camera;
 mod device;
+mod memory;
 
 use device::Device;
 
@@ -9,7 +10,6 @@ use std::{
     iter,
     mem::{size_of, ManuallyDrop},
     ops::Range,
-    ptr,
     rc::Rc,
     time::Instant,
 };
@@ -18,16 +18,16 @@ use gfx_hal::{
     adapter::{Adapter, PhysicalDevice},
     buffer::{self, SubRange},
     command::{
-        BufferCopy, BufferImageCopy, ClearColor, ClearDepthStencil, ClearValue, CommandBuffer,
-        CommandBufferFlags, Level, RenderAttachmentInfo, SubpassContents,
+        ClearColor, ClearDepthStencil, ClearValue, CommandBuffer, CommandBufferFlags, Level,
+        RenderAttachmentInfo, SubpassContents,
     },
     device::Device as _,
     format::{Aspects, ChannelType, Format, ImageFeature, Swizzle},
     image::{
-        self as gfximg, Extent, FramebufferAttachment, Layout, SamplerDesc, SubresourceLayers,
-        SubresourceRange, ViewCapabilities, ViewKind,
+        self as gfximg, Extent, FramebufferAttachment, Layout, SamplerDesc, SubresourceRange,
+        ViewCapabilities, ViewKind,
     },
-    memory::{self as gfx_mem, Segment, SparseFlags},
+    memory::{self as gfx_mem, SparseFlags},
     pass::{
         Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, Subpass, SubpassDependency,
         SubpassDesc,
@@ -407,7 +407,7 @@ impl<B: gfx_hal::Backend> Material<B> {
         };
 
         unsafe {
-            copy_into_memory(
+            memory::copy_into_memory(
                 device,
                 raw_image.as_ptr(),
                 &mut staging_buffer.memory,
@@ -436,7 +436,7 @@ impl<B: gfx_hal::Backend> Material<B> {
         );
 
         // copy buffer to image
-        copy_buffer_to_image(
+        memory::copy_buffer_to_image(
             device,
             queue_group,
             &staging_buffer.buffer,
@@ -581,7 +581,7 @@ impl<B: gfx_hal::Backend> GameObject<B> {
 
         // copy data into staging buffer
         unsafe {
-            copy_into_memory(
+            memory::copy_into_memory(
                 device,
                 vertices.as_ptr() as *const u8,
                 &mut staging_buffer.memory,
@@ -599,7 +599,7 @@ impl<B: gfx_hal::Backend> GameObject<B> {
         };
 
         // copy staging buffer into final buffer
-        copy_buffer(
+        memory::copy_buffer(
             device,
             queue_group,
             &staging_buffer.buffer,
@@ -633,7 +633,7 @@ impl<B: gfx_hal::Backend> GameObject<B> {
         };
 
         unsafe {
-            copy_into_memory(
+            memory::copy_into_memory(
                 device,
                 indices.as_ptr() as *const u8,
                 &mut staging_buffer.memory,
@@ -650,7 +650,7 @@ impl<B: gfx_hal::Backend> GameObject<B> {
             )
         };
 
-        copy_buffer(
+        memory::copy_buffer(
             device,
             queue_group,
             &staging_buffer.buffer,
@@ -740,7 +740,7 @@ impl<B: gfx_hal::Backend> GameObject<B> {
             view: camera_view.clone(),
             projection: camera_projection.clone(),
         };
-        copy_into_memory(
+        memory::copy_into_memory(
             &self.device,
             &transformations as *const Transformations as *const u8,
             &mut self.mvp_uniform_buffers[frame_id].memory,
@@ -1871,133 +1871,6 @@ fn main() {
         }
         _ => (),
     });
-}
-
-// todo: move the following functions into a memory module?
-fn copy_buffer_to_image<B: gfx_hal::Backend>(
-    device: &Rc<Device<B>>,
-    queue_group: &mut QueueGroup<B>,
-    source: &B::Buffer,
-    destination: &B::Image,
-    command_pool: &mut B::CommandPool,
-    width: u32,
-    height: u32,
-) {
-    let mut copy_fence = device
-        .logical_device()
-        .create_fence(false)
-        .expect("Out of memory creating fence");
-
-    unsafe {
-        let mut command_buffer = command_pool.allocate_one(Level::Primary);
-        command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
-
-        command_buffer.copy_buffer_to_image(
-            &source,
-            &destination,
-            Layout::TransferDstOptimal,
-            iter::once(BufferImageCopy {
-                buffer_offset: 0,
-                buffer_width: width,
-                buffer_height: height,
-                image_layers: SubresourceLayers {
-                    aspects: Aspects::COLOR,
-                    level: 0,
-                    layers: 0..1,
-                },
-                image_offset: gfximg::Offset::ZERO,
-                image_extent: Extent {
-                    width: width,
-                    height: height,
-                    depth: 1,
-                },
-            }),
-        );
-        command_buffer.finish();
-        queue_group.queues[0].submit(
-            iter::once(&command_buffer),
-            iter::empty(),
-            iter::empty(),
-            Some(&mut copy_fence),
-        );
-
-        device
-            .logical_device()
-            .wait_for_fence(&copy_fence, !0)
-            .unwrap();
-        command_pool.free(iter::once(command_buffer));
-        device.logical_device().destroy_fence(copy_fence);
-    }
-}
-
-/// Copies into a CPU visible buffer, undefined behavior if memory is not CPU visible!
-unsafe fn copy_into_memory<B: gfx_hal::Backend>(
-    device: &Rc<Device<B>>,
-    source: *const u8,
-    destination: &mut B::Memory,
-    len: usize,
-) {
-    // todo: consider keeping the memory mapped for uniform buffers
-    let mapping = device
-        .logical_device()
-        .map_memory(destination, Segment::ALL)
-        .unwrap();
-    ptr::copy_nonoverlapping(source, mapping, len);
-
-    // manually flush the memory, so that it is ensured to be available to the GPU.
-    // if instead limited buffer_memory_type to a type that contains the property
-    // memory::Properties::COHERENT, we wouldn't have to explicitly flush, possible
-    // optimization for the future.
-    // either way however, the memory is not guaranteed to be visible on the GPU yet
-    // until we submit our queue, according to the specification.
-    device
-        .logical_device()
-        .flush_mapped_memory_ranges(iter::once((&*destination, Segment::ALL)))
-        .unwrap();
-
-    device.logical_device().unmap_memory(destination);
-}
-
-fn copy_buffer<B: gfx_hal::Backend>(
-    device: &Rc<Device<B>>,
-    queue_group: &mut QueueGroup<B>,
-    source: &B::Buffer,
-    destination: &B::Buffer,
-    command_pool: &mut B::CommandPool,
-    len: u64,
-) {
-    let mut copy_fence = device
-        .logical_device()
-        .create_fence(false)
-        .expect("Out of memory creating fence");
-
-    unsafe {
-        let mut command_buffer = command_pool.allocate_one(Level::Primary);
-        command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
-        command_buffer.copy_buffer(
-            &*source,
-            &*destination,
-            iter::once(BufferCopy {
-                src: 0,
-                dst: 0,
-                size: len as u64,
-            }),
-        );
-        command_buffer.finish();
-        queue_group.queues[0].submit(
-            iter::once(&command_buffer),
-            iter::empty(),
-            iter::empty(),
-            Some(&mut copy_fence),
-        );
-
-        device
-            .logical_device()
-            .wait_for_fence(&copy_fence, !0)
-            .unwrap();
-        command_pool.free(iter::once(command_buffer));
-        device.logical_device().destroy_fence(copy_fence);
-    }
 }
 
 // todo: this might be needed again for proper dpi handling
