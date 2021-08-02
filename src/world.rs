@@ -1,7 +1,7 @@
 use crate::{
     device::Device,
     memory::{self, Buffer},
-    Material,
+    render::Material,
 };
 
 use std::{iter, mem::size_of, rc::Rc};
