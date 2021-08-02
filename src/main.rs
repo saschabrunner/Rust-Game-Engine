@@ -3,6 +3,7 @@ mod device;
 mod memory;
 
 use device::Device;
+use memory::Buffer;
 
 use std::{
     borrow::Borrow,
@@ -70,64 +71,6 @@ struct Transformations {
     model: Matrix4<f32>,
     view: Matrix4<f32>,
     projection: Matrix4<f32>,
-}
-
-struct Buffer<B: gfx_hal::Backend> {
-    device: Rc<Device<B>>,
-    buffer: ManuallyDrop<B::Buffer>,
-    memory: ManuallyDrop<B::Memory>, // this should be replaced by memory from an allocator
-}
-
-impl<B: gfx_hal::Backend> Buffer<B> {
-    unsafe fn new(
-        device: &Rc<Device<B>>,
-        buffer_len: u64,
-        usage: buffer::Usage,
-        properties: gfx_mem::Properties,
-    ) -> Self {
-        let mut buffer = ManuallyDrop::new(
-            device
-                .logical_device()
-                .create_buffer(buffer_len, usage, SparseFlags::empty())
-                .unwrap(),
-        );
-
-        let buffer_requirements = device.logical_device().get_buffer_requirements(&buffer);
-
-        let buffer_memory_type = device.find_memory_type(buffer_requirements.type_mask, properties);
-
-        let memory = device
-            .logical_device()
-            .allocate_memory(buffer_memory_type, buffer_requirements.size)
-            .unwrap();
-        device
-            .logical_device()
-            .bind_buffer_memory(&memory, 0, &mut buffer)
-            .unwrap();
-        let memory = ManuallyDrop::new(memory);
-
-        Buffer {
-            device: device.clone(),
-            buffer,
-            memory,
-        }
-    }
-}
-
-impl<B: gfx_hal::Backend> Drop for Buffer<B> {
-    fn drop(&mut self) {
-        // wait for device to become idle
-        self.device.logical_device().wait_idle().unwrap();
-
-        unsafe {
-            self.device
-                .logical_device()
-                .destroy_buffer(ManuallyDrop::take(&mut self.buffer));
-            self.device
-                .logical_device()
-                .free_memory(ManuallyDrop::take(&mut self.memory));
-        }
-    }
 }
 
 struct Image<B: gfx_hal::Backend> {
@@ -407,10 +350,10 @@ impl<B: gfx_hal::Backend> Material<B> {
         };
 
         unsafe {
-            memory::copy_into_memory(
+            memory::copy_into_buffer(
                 device,
                 raw_image.as_ptr(),
-                &mut staging_buffer.memory,
+                &mut staging_buffer,
                 buffer_len as usize,
             )
         };
@@ -439,7 +382,7 @@ impl<B: gfx_hal::Backend> Material<B> {
         memory::copy_buffer_to_image(
             device,
             queue_group,
-            &staging_buffer.buffer,
+            &staging_buffer,
             &texture_image.image,
             command_pool,
             raw_image.width(),
@@ -581,10 +524,10 @@ impl<B: gfx_hal::Backend> GameObject<B> {
 
         // copy data into staging buffer
         unsafe {
-            memory::copy_into_memory(
+            memory::copy_into_buffer(
                 device,
                 vertices.as_ptr() as *const u8,
-                &mut staging_buffer.memory,
+                &mut staging_buffer,
                 buffer_len,
             )
         };
@@ -602,8 +545,8 @@ impl<B: gfx_hal::Backend> GameObject<B> {
         memory::copy_buffer(
             device,
             queue_group,
-            &staging_buffer.buffer,
-            &buffer.buffer,
+            &staging_buffer,
+            &buffer,
             command_pool,
             buffer_len as u64,
         );
@@ -633,10 +576,10 @@ impl<B: gfx_hal::Backend> GameObject<B> {
         };
 
         unsafe {
-            memory::copy_into_memory(
+            memory::copy_into_buffer(
                 device,
                 indices.as_ptr() as *const u8,
-                &mut staging_buffer.memory,
+                &mut staging_buffer,
                 buffer_len,
             )
         };
@@ -653,8 +596,8 @@ impl<B: gfx_hal::Backend> GameObject<B> {
         memory::copy_buffer(
             device,
             queue_group,
-            &staging_buffer.buffer,
-            &buffer.buffer,
+            &staging_buffer,
+            &buffer,
             command_pool,
             buffer_len as u64,
         );
@@ -706,7 +649,7 @@ impl<B: gfx_hal::Backend> GameObject<B> {
                         binding: 0,
                         array_offset: 0,
                         descriptors: vec![Descriptor::Buffer(
-                            &*uniform_buffers[i].buffer,
+                            uniform_buffers[i].buffer(),
                             SubRange::WHOLE,
                         )]
                         .into_iter(),
@@ -740,20 +683,20 @@ impl<B: gfx_hal::Backend> GameObject<B> {
             view: camera_view.clone(),
             projection: camera_projection.clone(),
         };
-        memory::copy_into_memory(
+        memory::copy_into_buffer(
             &self.device,
             &transformations as *const Transformations as *const u8,
-            &mut self.mvp_uniform_buffers[frame_id].memory,
+            &mut self.mvp_uniform_buffers[frame_id],
             size_of::<Transformations>(),
         );
 
         // bind resources
         command_buffer.bind_vertex_buffers(
             0,
-            iter::once((&*self.vertex_buffer.buffer, SubRange::WHOLE)),
+            iter::once((self.vertex_buffer.buffer(), SubRange::WHOLE)),
         );
         command_buffer.bind_index_buffer(
-            &*self.index_buffer.buffer,
+            self.index_buffer.buffer(),
             SubRange::WHOLE,
             IndexType::U16,
         );

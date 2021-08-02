@@ -1,21 +1,85 @@
 use crate::device::Device;
 
-use std::{iter, ptr, rc::Rc};
+use std::{iter, mem::ManuallyDrop, ptr, rc::Rc};
 
 use gfx_hal::{
+    buffer,
     command::{BufferCopy, BufferImageCopy, CommandBuffer, CommandBufferFlags, Level},
     device::Device as _,
     format::Aspects,
     image::{self as gfximg, Extent, Layout, SubresourceLayers},
-    memory::Segment,
+    memory::{self as gfx_mem, Segment, SparseFlags},
     pool::CommandPool,
     queue::{Queue, QueueGroup},
 };
 
+pub struct Buffer<B: gfx_hal::Backend> {
+    device: Rc<Device<B>>,
+    buffer: ManuallyDrop<B::Buffer>,
+    memory: ManuallyDrop<B::Memory>, // this should be replaced by memory from an allocator
+}
+
+impl<B: gfx_hal::Backend> Buffer<B> {
+    pub unsafe fn new(
+        device: &Rc<Device<B>>,
+        buffer_len: u64,
+        usage: buffer::Usage,
+        properties: gfx_mem::Properties,
+    ) -> Self {
+        let mut buffer = ManuallyDrop::new(
+            device
+                .logical_device()
+                .create_buffer(buffer_len, usage, SparseFlags::empty())
+                .unwrap(),
+        );
+
+        let buffer_requirements = device.logical_device().get_buffer_requirements(&buffer);
+
+        let buffer_memory_type = device.find_memory_type(buffer_requirements.type_mask, properties);
+
+        let memory = device
+            .logical_device()
+            .allocate_memory(buffer_memory_type, buffer_requirements.size)
+            .unwrap();
+        device
+            .logical_device()
+            .bind_buffer_memory(&memory, 0, &mut buffer)
+            .unwrap();
+        let memory = ManuallyDrop::new(memory);
+
+        Buffer {
+            device: device.clone(),
+            buffer,
+            memory,
+        }
+    }
+
+    /// Get a reference to the raw gfx-rs buffer.
+    pub fn buffer(&self) -> &B::Buffer {
+        &self.buffer
+    }
+}
+
+impl<B: gfx_hal::Backend> Drop for Buffer<B> {
+    fn drop(&mut self) {
+        // wait for device to become idle
+        self.device.logical_device().wait_idle().unwrap();
+
+        unsafe {
+            self.device
+                .logical_device()
+                .destroy_buffer(ManuallyDrop::take(&mut self.buffer));
+            self.device
+                .logical_device()
+                .free_memory(ManuallyDrop::take(&mut self.memory));
+        }
+    }
+}
+
 pub fn copy_buffer_to_image<B: gfx_hal::Backend>(
     device: &Rc<Device<B>>,
     queue_group: &mut QueueGroup<B>,
-    source: &B::Buffer,
+    source: &Buffer<B>,
     destination: &B::Image,
     command_pool: &mut B::CommandPool,
     width: u32,
@@ -31,7 +95,7 @@ pub fn copy_buffer_to_image<B: gfx_hal::Backend>(
         command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
 
         command_buffer.copy_buffer_to_image(
-            &source,
+            &source.buffer,
             &destination,
             Layout::TransferDstOptimal,
             iter::once(BufferImageCopy {
@@ -69,16 +133,16 @@ pub fn copy_buffer_to_image<B: gfx_hal::Backend>(
 }
 
 /// Copies into a CPU visible buffer, undefined behavior if memory is not CPU visible!
-pub unsafe fn copy_into_memory<B: gfx_hal::Backend>(
+pub unsafe fn copy_into_buffer<B: gfx_hal::Backend>(
     device: &Rc<Device<B>>,
     source: *const u8,
-    destination: &mut B::Memory,
+    destination: &mut Buffer<B>,
     len: usize,
 ) {
     // todo: consider keeping the memory mapped for uniform buffers
     let mapping = device
         .logical_device()
-        .map_memory(destination, Segment::ALL)
+        .map_memory(&mut destination.memory, Segment::ALL)
         .unwrap();
     ptr::copy_nonoverlapping(source, mapping, len);
 
@@ -90,17 +154,19 @@ pub unsafe fn copy_into_memory<B: gfx_hal::Backend>(
     // until we submit our queue, according to the specification.
     device
         .logical_device()
-        .flush_mapped_memory_ranges(iter::once((&*destination, Segment::ALL)))
+        .flush_mapped_memory_ranges(iter::once((&*destination.memory, Segment::ALL)))
         .unwrap();
 
-    device.logical_device().unmap_memory(destination);
+    device
+        .logical_device()
+        .unmap_memory(&mut destination.memory);
 }
 
 pub fn copy_buffer<B: gfx_hal::Backend>(
     device: &Rc<Device<B>>,
     queue_group: &mut QueueGroup<B>,
-    source: &B::Buffer,
-    destination: &B::Buffer,
+    source: &Buffer<B>,
+    destination: &Buffer<B>,
     command_pool: &mut B::CommandPool,
     len: u64,
 ) {
@@ -113,8 +179,8 @@ pub fn copy_buffer<B: gfx_hal::Backend>(
         let mut command_buffer = command_pool.allocate_one(Level::Primary);
         command_buffer.begin_primary(CommandBufferFlags::ONE_TIME_SUBMIT);
         command_buffer.copy_buffer(
-            &*source,
-            &*destination,
+            &*source.buffer,
+            &*destination.buffer,
             iter::once(BufferCopy {
                 src: 0,
                 dst: 0,
