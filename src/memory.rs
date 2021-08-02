@@ -1,4 +1,5 @@
 use crate::device::Device;
+use crate::image::Image;
 
 use std::{iter, mem::ManuallyDrop, ptr, rc::Rc};
 
@@ -80,7 +81,7 @@ pub fn copy_buffer_to_image<B: gfx_hal::Backend>(
     device: &Rc<Device<B>>,
     queue_group: &mut QueueGroup<B>,
     source: &Buffer<B>,
-    destination: &B::Image,
+    destination: &Image<B>,
     command_pool: &mut B::CommandPool,
     width: u32,
     height: u32,
@@ -96,7 +97,7 @@ pub fn copy_buffer_to_image<B: gfx_hal::Backend>(
 
         command_buffer.copy_buffer_to_image(
             &source.buffer,
-            &destination,
+            destination.image(),
             Layout::TransferDstOptimal,
             iter::once(BufferImageCopy {
                 buffer_offset: 0,
