@@ -45,7 +45,7 @@ use gfx_hal::{
     Instance,
 };
 
-use nalgebra::{Point3, Similarity3, UnitQuaternion, Vector3};
+use nalgebra::{Point3, Similarity3, Translation3, UnitQuaternion, Vector3};
 
 pub struct Renderer<B: gfx_hal::Backend> {
     camera: Camera,
@@ -65,7 +65,7 @@ pub struct Renderer<B: gfx_hal::Backend> {
     game_objects: Vec<GameObject<B>>,
     frames_in_flight: usize,
     frame: u64,
-    _start_time: Instant, // might get used in the future
+    start_time: Instant,
     last_frame: Instant,
     // these are dropped in the order they are declared, very important!
     // currently assuming that during drop, this is the only Rc to this device!
@@ -277,7 +277,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             game_objects: vec![cube, floor],
             frames_in_flight,
             frame: 0,
-            _start_time: Instant::now(),
+            start_time: Instant::now(),
             last_frame: Instant::now(),
             device,
             queue_group,
@@ -371,12 +371,18 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         // calculate delta time and update time
         let current_time = Instant::now();
         let delta_time = (current_time - self.last_frame).as_secs_f32();
+        let application_time = (current_time - self.start_time).as_secs_f32();
         self.last_frame = current_time;
 
         // rotate and move cube with time
         let transform = self.game_objects[0].get_transform();
-        transform.isometry.rotation = transform.isometry.rotation
-            * UnitQuaternion::from_euler_angles(0.0, -delta_time, delta_time);
+        transform.isometry.rotation *=
+            UnitQuaternion::from_euler_angles(0.0, -delta_time, delta_time);
+        transform.isometry.translation = Translation3::<f32>::new(
+            (application_time * 0.5).sin() * 5.0,
+            (application_time * 0.7).sin() * 4.0,
+            (application_time * 0.8).sin() * 4.0,
+        );
 
         let mut command_buffer = &mut *frame_resources.command_buffer;
         unsafe {
