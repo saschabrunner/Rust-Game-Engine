@@ -2,11 +2,13 @@ mod camera;
 mod device;
 mod image;
 mod memory;
+mod world;
 
 use crate::image::{Image, ImageView};
 use camera::{Camera, CameraDesc};
 use device::Device;
 use memory::Buffer;
+use world::{GameObject, Vertex};
 
 use std::{
     borrow::Borrow,
@@ -19,14 +21,16 @@ use std::{
 
 use gfx_hal::{
     adapter::{Adapter, PhysicalDevice},
-    buffer::{self, SubRange},
+    buffer as gfx_buf,
     command::{
         ClearColor, ClearDepthStencil, ClearValue, CommandBuffer, CommandBufferFlags, Level,
         RenderAttachmentInfo, SubpassContents,
     },
     device::Device as _,
     format::{Aspects, ChannelType, Format, ImageFeature},
-    image::{self as gfximg, Extent, FramebufferAttachment, Layout, SamplerDesc, ViewCapabilities},
+    image::{
+        self as gfx_img, Extent, FramebufferAttachment, Layout, SamplerDesc, ViewCapabilities,
+    },
     memory as gfx_mem,
     pass::{
         Attachment, AttachmentLoadOp, AttachmentOps, AttachmentStoreOp, Subpass, SubpassDependency,
@@ -44,10 +48,10 @@ use gfx_hal::{
     },
     queue::{family::QueueFamilyId, Queue, QueueGroup},
     window::{Extent2D, PresentationSurface, Surface, SwapchainConfig},
-    IndexType, Instance,
+    Instance,
 };
 
-use nalgebra::{Matrix4, Point3, Similarity3, UnitQuaternion, Vector3};
+use nalgebra::{Point3, Similarity3, UnitQuaternion, Vector3};
 
 use winit::{
     dpi::LogicalSize,
@@ -55,22 +59,7 @@ use winit::{
     event_loop::ControlFlow,
 };
 
-// not dead code, we use memcpy on these structs
-#[allow(dead_code)]
-struct Vertex {
-    position: [f32; 3],
-    color: [f32; 3],
-    uv: [f32; 2],
-}
-
-#[allow(dead_code)]
-struct Transformations {
-    model: Matrix4<f32>,
-    view: Matrix4<f32>,
-    projection: Matrix4<f32>,
-}
-
-struct Material<B: gfx_hal::Backend> {
+pub struct Material<B: gfx_hal::Backend> {
     device: Rc<Device<B>>,
     texture: ImageView<B>, // currently a material is only made out of a texture
     descriptor_sets: Vec<B::DescriptorSet>, // per frame in flight, will not be freed after allocation
@@ -124,7 +113,7 @@ impl<B: gfx_hal::Backend> Material<B> {
             Buffer::new(
                 device,
                 padded_buffer_len,
-                buffer::Usage::TRANSFER_SRC,
+                gfx_buf::Usage::TRANSFER_SRC,
                 gfx_mem::Properties::CPU_VISIBLE,
             )
         };
@@ -144,8 +133,8 @@ impl<B: gfx_hal::Backend> Material<B> {
                 raw_image.width(),
                 raw_image.height(),
                 Format::Rgba8Srgb,
-                gfximg::Tiling::Optimal,
-                gfximg::Usage::TRANSFER_DST | gfximg::Usage::SAMPLED,
+                gfx_img::Tiling::Optimal,
+                gfx_img::Usage::TRANSFER_DST | gfx_img::Usage::SAMPLED,
                 gfx_mem::Properties::DEVICE_LOCAL,
             )
         };
@@ -182,7 +171,7 @@ impl<B: gfx_hal::Backend> Material<B> {
             texture_image,
             Format::Rgba8Srgb,
             Aspects::COLOR,
-            gfximg::Usage::SAMPLED,
+            gfx_img::Usage::SAMPLED,
         )
     }
 
@@ -230,269 +219,6 @@ impl<B: gfx_hal::Backend> Material<B> {
 
     pub fn get_descriptor_set<'a>(&'a self, frame_id: usize) -> &'a B::DescriptorSet {
         &self.descriptor_sets[frame_id]
-    }
-}
-
-struct GameObject<B: gfx_hal::Backend> {
-    device: Rc<Device<B>>,
-    transform: Similarity3<f32>,
-    vertex_buffer: Buffer<B>, // todo: make this a reference shared accross objects (mesh struct?)
-    index_buffer: Buffer<B>,  // todo: make this a reference shared accross objects (mesh struct?)
-    index_count: usize,       // todo: make this a reference shared accross objects (mesh struct?)
-    mvp_uniform_buffers: Vec<Buffer<B>>, // per frame in flight // todo: split this up, so vp part can be shared accross objects
-    mvp_descriptor_sets: Vec<B::DescriptorSet>, // per frame in flight, will not be freed after allocation, only containing mvp buffers // todo: move vp into seperate set, provided by camera instead of by every object and bind before material
-    material: Material<B>, // todo: make this a reference shared accross objects
-}
-
-impl<B: gfx_hal::Backend> GameObject<B> {
-    pub unsafe fn new(
-        device: &Rc<Device<B>>,
-        queue_group: &mut QueueGroup<B>,
-        command_pool: &mut B::CommandPool,
-        mvp_descriptor_set_layout: &B::DescriptorSetLayout,
-        descriptor_pool: &mut B::DescriptorPool,
-        frames_in_flight: usize,
-        vertices: &[Vertex],
-        indices: &[u16],
-        initial_transform: &Similarity3<f32>,
-        material: Material<B>, // todo: don't take ownership, reuse
-    ) -> GameObject<B> {
-        let vertex_buffer = Self::create_vertex_buffer(device, queue_group, command_pool, vertices);
-        let index_buffer = Self::create_index_buffer(device, queue_group, command_pool, indices);
-        let mvp_uniform_buffers = Self::create_uniform_buffers(device, frames_in_flight);
-        let mvp_descriptor_sets = Self::create_descriptor_sets(
-            device,
-            mvp_descriptor_set_layout,
-            descriptor_pool,
-            &mvp_uniform_buffers,
-            frames_in_flight,
-        );
-
-        GameObject {
-            device: device.clone(),
-            transform: initial_transform.clone(),
-            vertex_buffer,
-            index_buffer,
-            index_count: indices.len(),
-            mvp_uniform_buffers,
-            mvp_descriptor_sets,
-            material,
-        }
-    }
-
-    fn create_vertex_buffer(
-        device: &Rc<Device<B>>,
-        queue_group: &mut QueueGroup<B>,
-        command_pool: &mut B::CommandPool,
-        vertices: &[Vertex],
-    ) -> Buffer<B> {
-        let buffer_stride = size_of::<Vertex>();
-        let buffer_len = vertices.len() * buffer_stride;
-        // buffer needs to have size that's a multiple of non_coherent_atom_size for it to be mapped
-        let padded_buffer_len = ((buffer_len + device.limits().non_coherent_atom_size - 1)
-            / device.limits().non_coherent_atom_size
-            * device.limits().non_coherent_atom_size) as u64;
-
-        let mut staging_buffer = unsafe {
-            Buffer::new(
-                device,
-                padded_buffer_len,
-                buffer::Usage::TRANSFER_SRC,
-                gfx_mem::Properties::CPU_VISIBLE,
-            )
-        };
-
-        // copy data into staging buffer
-        unsafe {
-            memory::copy_into_buffer(
-                device,
-                vertices.as_ptr() as *const u8,
-                &mut staging_buffer,
-                buffer_len,
-            )
-        };
-
-        let buffer = unsafe {
-            Buffer::new(
-                device,
-                buffer_len as u64,
-                buffer::Usage::TRANSFER_DST | buffer::Usage::VERTEX,
-                gfx_mem::Properties::DEVICE_LOCAL,
-            )
-        };
-
-        // copy staging buffer into final buffer
-        memory::copy_buffer(
-            device,
-            queue_group,
-            &staging_buffer,
-            &buffer,
-            command_pool,
-            buffer_len as u64,
-        );
-
-        buffer
-    }
-
-    fn create_index_buffer(
-        device: &Rc<Device<B>>,
-        queue_group: &mut QueueGroup<B>,
-        command_pool: &mut B::CommandPool,
-        indices: &[u16],
-    ) -> Buffer<B> {
-        let buffer_stride = size_of::<u16>();
-        let buffer_len = indices.len() * buffer_stride;
-        let padded_buffer_len = ((buffer_len + device.limits().non_coherent_atom_size - 1)
-            / device.limits().non_coherent_atom_size
-            * device.limits().non_coherent_atom_size) as u64;
-
-        let mut staging_buffer = unsafe {
-            Buffer::new(
-                device,
-                padded_buffer_len,
-                buffer::Usage::TRANSFER_SRC,
-                gfx_mem::Properties::CPU_VISIBLE,
-            )
-        };
-
-        unsafe {
-            memory::copy_into_buffer(
-                device,
-                indices.as_ptr() as *const u8,
-                &mut staging_buffer,
-                buffer_len,
-            )
-        };
-
-        let buffer = unsafe {
-            Buffer::new(
-                device,
-                buffer_len as u64,
-                buffer::Usage::TRANSFER_DST | buffer::Usage::INDEX,
-                gfx_mem::Properties::DEVICE_LOCAL,
-            )
-        };
-
-        memory::copy_buffer(
-            device,
-            queue_group,
-            &staging_buffer,
-            &buffer,
-            command_pool,
-            buffer_len as u64,
-        );
-
-        buffer
-    }
-
-    fn create_uniform_buffers(device: &Rc<Device<B>>, frames_in_flight: usize) -> Vec<Buffer<B>> {
-        let mut uniform_buffers = Vec::with_capacity(frames_in_flight);
-        let padded_length =
-            ((size_of::<Transformations>() + device.limits().non_coherent_atom_size - 1)
-                / device.limits().non_coherent_atom_size
-                * device.limits().non_coherent_atom_size) as u64;
-        for _ in 0..frames_in_flight {
-            uniform_buffers.push(unsafe {
-                Buffer::new(
-                    device,
-                    padded_length,
-                    buffer::Usage::UNIFORM,
-                    gfx_mem::Properties::CPU_VISIBLE,
-                )
-            });
-        }
-
-        uniform_buffers
-    }
-
-    fn create_descriptor_sets(
-        device: &Rc<Device<B>>,
-        descriptor_set_layout: &B::DescriptorSetLayout,
-        descriptor_pool: &mut B::DescriptorPool,
-        uniform_buffers: &[Buffer<B>],
-        frames_in_flight: usize,
-    ) -> Vec<B::DescriptorSet> {
-        let mut descriptor_sets = Vec::with_capacity(frames_in_flight);
-        let mut cloned_layouts = Vec::with_capacity(frames_in_flight);
-        for _ in 0..frames_in_flight {
-            cloned_layouts.push(&*descriptor_set_layout);
-        }
-        unsafe { descriptor_pool.allocate(cloned_layouts.into_iter(), &mut descriptor_sets) }
-            .unwrap();
-
-        for i in 0..frames_in_flight {
-            unsafe {
-                device
-                    .logical_device()
-                    .write_descriptor_set(DescriptorSetWrite {
-                        set: &mut descriptor_sets[i],
-                        binding: 0,
-                        array_offset: 0,
-                        descriptors: vec![Descriptor::Buffer(
-                            uniform_buffers[i].buffer(),
-                            SubRange::WHOLE,
-                        )]
-                        .into_iter(),
-                    })
-            }
-        }
-
-        descriptor_sets
-    }
-
-    pub fn get_transform(&mut self) -> &mut Similarity3<f32> {
-        &mut self.transform
-    }
-
-    /// Copies buffers and records a draw call for this object.
-    ///
-    /// # Safety
-    ///
-    /// - `pipeline_layout` must be compatible with this object's descriptor sets.
-    pub unsafe fn draw(
-        &mut self,
-        command_buffer: &mut B::CommandBuffer,
-        pipeline_layout: &B::PipelineLayout,
-        camera_view: &Matrix4<f32>,
-        camera_projection: &Matrix4<f32>,
-        frame_id: usize,
-    ) {
-        // copy uniform buffers
-        let transformations = Transformations {
-            model: self.transform.to_homogeneous(),
-            view: camera_view.clone(),
-            projection: camera_projection.clone(),
-        };
-        memory::copy_into_buffer(
-            &self.device,
-            &transformations as *const Transformations as *const u8,
-            &mut self.mvp_uniform_buffers[frame_id],
-            size_of::<Transformations>(),
-        );
-
-        // bind resources
-        command_buffer.bind_vertex_buffers(
-            0,
-            iter::once((self.vertex_buffer.buffer(), SubRange::WHOLE)),
-        );
-        command_buffer.bind_index_buffer(
-            self.index_buffer.buffer(),
-            SubRange::WHOLE,
-            IndexType::U16,
-        );
-        command_buffer.bind_graphics_descriptor_sets(
-            pipeline_layout,
-            0,
-            vec![
-                &self.mvp_descriptor_sets[frame_id],
-                self.material.get_descriptor_set(frame_id),
-            ]
-            .into_iter(),
-            iter::empty(),
-        );
-
-        // draw
-        command_buffer.draw_indexed(0..self.index_count as u32, 0, 0..1);
     }
 }
 
@@ -726,8 +452,8 @@ impl<B: gfx_hal::Backend> FrameResources<B> {
             surface_extent.width,
             surface_extent.height,
             depth_format,
-            gfximg::Tiling::Optimal,
-            gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+            gfx_img::Tiling::Optimal,
+            gfx_img::Usage::DEPTH_STENCIL_ATTACHMENT,
             gfx_mem::Properties::DEVICE_LOCAL,
         );
 
@@ -736,7 +462,7 @@ impl<B: gfx_hal::Backend> FrameResources<B> {
             depth_image,
             depth_format,
             Aspects::DEPTH, // todo: stencil aspect
-            gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+            gfx_img::Usage::DEPTH_STENCIL_ATTACHMENT,
         )
     }
 }
@@ -911,8 +637,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 &mvp_descriptor_set_layout,
                 &mut descriptor_pool,
                 frames_in_flight,
-                &CUBE_VERTICES,
-                &CUBE_INDICES,
+                &world::CUBE_VERTICES,
+                &world::CUBE_INDICES,
                 &Similarity3::<f32>::new(Vector3::zeros(), Vector3::zeros(), 1.0),
                 material_planks,
             )
@@ -926,8 +652,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 &mvp_descriptor_set_layout,
                 &mut descriptor_pool,
                 frames_in_flight,
-                &QUAD_VERTICES,
-                &QUAD_INDICES,
+                &world::QUAD_VERTICES,
+                &world::QUAD_INDICES,
                 &Similarity3::<f32>::new(
                     Vector3::new(0.0, 110.0, 0.0),
                     Vector3::x() * std::f32::consts::FRAC_PI_2,
@@ -987,7 +713,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         // gfx-rs uses imageless framebuffers,
         // we don't have to recreate them every frame.
         let depth_attachment = FramebufferAttachment {
-            usage: gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+            usage: gfx_img::Usage::DEPTH_STENCIL_ATTACHMENT,
             view_caps: ViewCapabilities::empty(),
             format: depth_format,
         };
@@ -1057,7 +783,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 .destroy_framebuffer(ManuallyDrop::take(&mut self.framebuffer));
 
             let depth_attachment = FramebufferAttachment {
-                usage: gfximg::Usage::DEPTH_STENCIL_ATTACHMENT,
+                usage: gfx_img::Usage::DEPTH_STENCIL_ATTACHMENT,
                 view_caps: ViewCapabilities::empty(),
                 format: self.depth_format,
             };
@@ -1218,18 +944,18 @@ impl<B: gfx_hal::Backend> Renderer<B> {
     fn find_compatible_format<'a, I: Iterator<Item = &'a Format>>(
         physical_device: &B::PhysicalDevice,
         candidates: I,
-        tiling: gfximg::Tiling,
+        tiling: gfx_img::Tiling,
         features: ImageFeature,
     ) -> Option<Format> {
         for candidate in candidates {
             let properties = physical_device.format_properties(Some(*candidate));
             match tiling {
-                gfximg::Tiling::Optimal => {
+                gfx_img::Tiling::Optimal => {
                     if properties.optimal_tiling & features == features {
                         return Some(*candidate);
                     }
                 }
-                gfximg::Tiling::Linear => {
+                gfx_img::Tiling::Linear => {
                     if properties.linear_tiling & features == features {
                         return Some(*candidate);
                     }
@@ -1251,7 +977,7 @@ impl<B: gfx_hal::Backend> Renderer<B> {
                 Format::D32SfloatS8Uint,
             ]
             .iter(),
-            gfximg::Tiling::Optimal,
+            gfx_img::Tiling::Optimal,
             ImageFeature::DEPTH_STENCIL_ATTACHMENT,
         )
         .expect("Couldn't finad a compatible depth format.")
@@ -1346,8 +1072,8 @@ impl<B: gfx_hal::Backend> Renderer<B> {
         ManuallyDrop::new(
             unsafe {
                 device.logical_device().create_sampler(&SamplerDesc::new(
-                    gfximg::Filter::Linear,
-                    gfximg::WrapMode::Tile,
+                    gfx_img::Filter::Linear,
+                    gfx_img::WrapMode::Tile,
                 ))
             }
             .unwrap(),
@@ -1388,9 +1114,9 @@ impl<B: gfx_hal::Backend> Renderer<B> {
             passes: None..Some(0),
             stages: PipelineStage::COLOR_ATTACHMENT_OUTPUT | PipelineStage::EARLY_FRAGMENT_TESTS
                 ..PipelineStage::COLOR_ATTACHMENT_OUTPUT | PipelineStage::EARLY_FRAGMENT_TESTS,
-            accesses: gfximg::Access::empty()
-                ..gfximg::Access::COLOR_ATTACHMENT_WRITE
-                    | gfximg::Access::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            accesses: gfx_img::Access::empty()
+                ..gfx_img::Access::COLOR_ATTACHMENT_WRITE
+                    | gfx_img::Access::DEPTH_STENCIL_ATTACHMENT_WRITE,
             flags: gfx_mem::Dependencies::empty(),
         };
 
@@ -1462,64 +1188,6 @@ impl<B: gfx_hal::Backend> Drop for Renderer<B> {
 
 const APPLICATION_NAME: &'static str = "Rust Game Engine";
 const DEFAULT_WINDOW_SIZE: [u32; 2] = [512, 512];
-
-#[cfg_attr(rustfmt, rustfmt_skip)]
-const CUBE_VERTICES: [Vertex; 24] = [
-    Vertex { position: [-0.5, -0.5,  0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },    // front
-    Vertex { position: [-0.5,  0.5,  0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
-    Vertex { position: [ 0.5,  0.5,  0.5], color: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
-    Vertex { position: [ 0.5, -0.5,  0.5], color: [1.0, 1.0, 1.0], uv: [1.0, 0.0] },
-
-    Vertex { position: [ 0.5, -0.5, -0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },    // back
-    Vertex { position: [ 0.5,  0.5, -0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
-    Vertex { position: [-0.5,  0.5, -0.5], color: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
-    Vertex { position: [-0.5, -0.5, -0.5], color: [1.0, 1.0, 1.0], uv: [1.0, 0.0] },
-
-    Vertex { position: [-0.5, -0.5, -0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },    // left
-    Vertex { position: [-0.5,  0.5, -0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
-    Vertex { position: [-0.5,  0.5,  0.5], color: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
-    Vertex { position: [-0.5, -0.5,  0.5], color: [1.0, 1.0, 1.0], uv: [1.0, 0.0] },
-
-    Vertex { position: [ 0.5, -0.5,  0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },    // right
-    Vertex { position: [ 0.5,  0.5,  0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
-    Vertex { position: [ 0.5,  0.5, -0.5], color: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
-    Vertex { position: [ 0.5, -0.5, -0.5], color: [1.0, 1.0, 1.0], uv: [1.0, 0.0] },
-
-    Vertex { position: [-0.5, -0.5, -0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },    // top
-    Vertex { position: [-0.5, -0.5,  0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
-    Vertex { position: [ 0.5, -0.5,  0.5], color: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
-    Vertex { position: [ 0.5, -0.5, -0.5], color: [1.0, 1.0, 1.0], uv: [1.0, 0.0] },
-
-    Vertex { position: [-0.5,  0.5,  0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },    // bottom
-    Vertex { position: [-0.5,  0.5, -0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 1.0] },
-    Vertex { position: [ 0.5,  0.5, -0.5], color: [0.0, 0.0, 1.0], uv: [1.0, 1.0] },
-    Vertex { position: [ 0.5,  0.5,  0.5], color: [1.0, 1.0, 1.0], uv: [1.0, 0.0] },
-];
-
-// these indices must be counter-clockwise for backface culling to work
-#[cfg_attr(rustfmt, rustfmt_skip)]
-const CUBE_INDICES: [u16; 36] = [
-     0,  1,  2,  0,  2,  3, // front
-     4,  5,  6,  4,  6,  7, // back
-     8,  9, 10,  8, 10, 11, // left
-    12, 13, 14, 12, 14, 15, // right
-    16, 17, 18, 16, 18, 19, // top
-    20, 21, 22, 20, 22, 23, // bottom
-];
-
-#[cfg_attr(rustfmt, rustfmt_skip)]
-const QUAD_VERTICES: [Vertex; 4] = [
-    Vertex { position: [-0.5, -0.5,  0.5], color: [1.0, 0.0, 0.0], uv: [0.0, 0.0] },
-    Vertex { position: [-0.5,  0.5,  0.5], color: [0.0, 1.0, 0.0], uv: [0.0, 40.0] },
-    Vertex { position: [ 0.5,  0.5,  0.5], color: [0.0, 0.0, 1.0], uv: [40.0, 40.0] },
-    Vertex { position: [ 0.5, -0.5,  0.5], color: [1.0, 1.0, 1.0], uv: [40.0, 0.0] },
-];
-
-// these indices must be counter-clockwise for backface culling to work
-#[cfg_attr(rustfmt, rustfmt_skip)]
-const QUAD_INDICES: [u16; 6] = [
-     0,  1,  2,  0,  2,  3,
-];
 
 fn main() {
     let event_loop = winit::event_loop::EventLoop::new();
